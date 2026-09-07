@@ -1,0 +1,39 @@
+# 참가자 로스터 예제.
+#
+#   cp config/participants.example.yaml config/participants.yaml
+#
+# provider 는 .env 의 DEBATE_PROVIDER_*_NAME 을 가리킵니다. 참가자마다 다른
+# 엔드포인트를 쓸 수 있습니다 — 게이트웨이 한 개를 경유하지 않고 각 프로바이더를
+# 직접 호출합니다. 여기 없는 이름을 쓰면 LLM 을 부르기 전에 ConfigError 로
+# 죽습니다.
+#
+# label 은 적지 마세요. 실행 시 참가자 A/B/C... 로 자동 배정됩니다. 모델명이
+# Judge 프롬프트에 새지 않게 하려는 것이라 수동 지정을 막아둡니다.
+
+topic: "원격근무는 팀 생산성을 높이는가"
+rounds: 3          # 슬라이스 1 은 1 만 지원. 다라운드는 슬라이스 2.
+
+participants:
+  - id: p1
+    provider: openai            # .env 슬롯 1
+    model: REPLACE_ME           # 예: gpt-4o-mini
+    persona: "데이터와 측정 방법론을 중시하는 실증주의자"
+    stance: "찬성"
+
+  - id: p2
+    provider: groq              # .env 슬롯 2
+    model: REPLACE_ME
+    persona: "조직 문화와 암묵지 전수를 중시하는 현장주의자"
+    stance: "반대"
+
+  - id: p3
+    provider: openrouter        # .env 슬롯 3
+    model: REPLACE_ME
+    persona: "비용과 트레이드오프를 따지는 경제학적 회의주의자"
+    stance: null                # 입장 미지정 — 스스로 정합니다
+
+# Judge 는 참가자 풀에서 제외됩니다. 참가자와 같은 모델을 쓰면 실행 전에
+# ConfigError 로 거부합니다(자기편애로 점수가 오염되므로). 슬라이스 3 범위.
+judge:
+  provider: openai
+  model: REPLACE_ME
