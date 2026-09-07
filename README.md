@@ -29,19 +29,39 @@ Provider  →  Agent  →  DebateEngine  →  Judge  →  Storage  →  API
 
 ## 설치
 
+**macOS / Linux**
+
 ```bash
-uv venv --python 3.11 .venv
-uv pip install --python .venv/bin/python -e '.[dev]'
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
 ```
+
+**Windows (PowerShell)**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+```
+
+`Activate.ps1` 이 실행 정책 때문에 막히면 아래를 한 번 치고 다시 하세요.
+현재 창에만 적용되고 시스템 설정은 안 건드립니다.
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+**이 아래의 모든 명령은 venv 가 활성화된 상태를 가정합니다.** 활성화 없이 쓰려면
+`python` 자리에 macOS/Linux 는 `.venv/bin/python`, Windows 는
+`.venv\Scripts\python` 을 넣으세요.
 
 ## fake 모드로 돌려보기 (키 불필요)
 
 ```bash
-.venv/bin/python -m debate.cli models --provider fake
+python -m debate.cli models --provider fake
 
-.venv/bin/python -m debate.cli run --provider-override fake \
-    --topic "원격근무는 팀 생산성을 높이는가" \
-    --agent fake-a --agent fake-b --rounds 1 --fake-latency 1800,2100
+python -m debate.cli run --provider-override fake --topic "원격근무는 팀 생산성을 높이는가" --agent fake-a --agent fake-b --rounds 1 --fake-latency 1800,2100
 ```
 
 `FakeProvider` 는 테스트 픽스처가 아니라 1급 실행 모드입니다. 병렬성 · 재시도 ·
@@ -74,7 +94,8 @@ wall 3,501ms | sum(ok=2) 3,302ms | max 1,801ms | failed=1 | waves 1
 ## 실제 프로바이더 붙이기
 
 ```bash
-cp .env.example .env      # 슬롯 3개(openai / groq / openrouter)에 키를 채우세요
+cp .env.example .env      # PowerShell: copy .env.example .env
+                          # 슬롯 3개(openai / groq / openrouter)에 키를 채우세요
 ```
 
 게이트웨이 하나를 경유하지 않고 **참가자마다 다른 엔드포인트를 직접 호출**합니다.
@@ -92,8 +113,8 @@ participants:
 ```
 
 ```bash
-.venv/bin/python -m debate.cli models --provider openai   # 모델 ID 확인
-.venv/bin/python -m debate.cli run --config config/participants.yaml --rounds 1
+python -m debate.cli models --provider openai   # 모델 ID 확인
+python -m debate.cli run --config config/participants.yaml --rounds 1
 ```
 
 슬롯은 1..9 까지 스캔합니다. `.env.example` 이 3개를 보여줄 뿐 코드가 3개로
@@ -112,7 +133,7 @@ fake 모드는 **내 가정이 일관되는지**만 검증합니다. 실제 서�
 모두 비면 그냥 무시됩니다).
 
 ```bash
-cp .env.example .env
+cp .env.example .env          # PowerShell: copy .env.example .env
 ```
 
 ```dotenv
@@ -127,7 +148,7 @@ DEBATE_PROVIDER_1_API_KEY=sk-...                 # 실제 키
 ### 1단계 — 연결과 인증
 
 ```bash
-.venv/bin/python -m debate.cli models --provider openai
+python -m debate.cli models --provider openai
 ```
 
 **통과 조건**: 모델 ID 가 한 줄에 하나씩 출력되고 종료 코드 0.
@@ -146,13 +167,12 @@ gpt-4o
 
 1단계에서 확인한 ID 로 2명을 세웁니다. 같은 프로바이더를 두 번 써도 됩니다.
 
-```bash
-.venv/bin/python -m debate.cli run \
-    --topic "원격근무는 팀 생산성을 높이는가" \
-    --agent openai/gpt-4o-mini \
-    --agent openai/gpt-4o \
-    --rounds 1
 ```
+python -m debate.cli run --topic "원격근무는 팀 생산성을 높이는가" --agent openai/gpt-4o-mini --agent openai/gpt-4o --rounds 1
+```
+
+한 줄이 길어서 쪼개고 싶다면 이어쓰기 문자가 셸마다 다릅니다 — bash 는 `\`,
+PowerShell 은 백틱입니다. 헷갈리면 그냥 한 줄로 쓰세요.
 
 **통과 조건** — 네 가지가 모두 맞아야 합니다:
 
@@ -230,7 +250,7 @@ wall 2,118ms | sum(ok=2) 3,946ms | max 2,104ms | failed=0 | waves 1
 ## 테스트
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
+python -m pytest tests/ -q
 ```
 
 ## 종료 코드
@@ -258,3 +278,24 @@ wall 2,118ms | sum(ok=2) 3,946ms | max 2,104ms | failed=0 | waves 1
 v1 범위에서 **뺀 것**: 조기 종료(합의 시 라운드 중단), Judge 의 참가자 수별 분기,
 토론 재개. Judge 는 단일 패스로 고정하되 `prompt_tokens` 와 `finish_reason` 을
 기록해서 실제로 잘리는 시점을 관측할 수 있게만 해둡니다.
+
+### 슬라이스 3 시작 전 결론 낼 것 — Judge 격리의 구멍
+
+`allow_judge_model_overlap=False` 검사는 **모델 ID 만 비교**합니다. 그래서
+
+    참가자: gemini-2.x-flash   +   Judge: gemini-2.x-pro
+
+같은 조합은 **검사를 통과합니다.** 그런데 이 규칙이 애초에 막으려던 것은
+자기편애이고, 그건 같은 벤더·같은 계열 모델 사이에서도 상당 부분 남습니다.
+즉 **검사는 통과하는데 목적은 달성 못 하는 상태**입니다.
+
+프로바이더 키가 하나뿐이면 참가자도 Judge 도 전부 한 계열이 되므로 실제로 자주
+걸립니다. 슬라이스 3 에서 두 갈래 중 하나를 골라야 합니다:
+
+1. 계열(vendor/family) 단위 경고를 추가 — 계열 판정을 무엇으로 할지가 문제
+   (모델 ID 접두사? 프로바이더 이름? 수동 매핑표?). 오탐이 나면 정상 설정이
+   막힙니다.
+2. 문서에 한계로만 명시하고 검사는 ID 단위로 유지 — 구현은 안 늘지만 사용자가
+   구멍을 모르고 지나갈 수 있습니다.
+
+**아직 구현하지 않았습니다.** 슬라이스 3 진입 시 판단해서 제안할 항목입니다.
