@@ -175,11 +175,11 @@ async def test_malformed_body_is_retryable_not_crash():
 
 
 def test_slots_beyond_the_three_examples_are_picked_up():
-    slots = load_provider_slots({
+    registry = load_provider_slots({
         "DEBATE_PROVIDER_1_NAME": "a", "DEBATE_PROVIDER_1_BASE_URL": "https://a/v1",
         "DEBATE_PROVIDER_7_NAME": "g", "DEBATE_PROVIDER_7_BASE_URL": "http://localhost:1/v1",
-    })
-    assert set(slots) == {"a", "g"}
+    }, env_file=None)
+    assert registry.names() == ("a", "g")
 
 
 def test_api_key_never_appears_in_repr():
@@ -195,7 +195,7 @@ def test_api_key_never_appears_in_repr():
 ])
 def test_bad_slots_rejected(env, match):
     with pytest.raises(ConfigError, match=match):
-        load_provider_slots(env)
+        load_provider_slots(env, env_file=None)
 
 
 def test_known_zero_price_differs_from_unknown_price():
@@ -220,8 +220,8 @@ async def test_trailing_slash_in_base_url_is_harmless(raw):
         return httpx.Response(200, json={"choices": [{"message": {"content": "x"}}], "usage": {}})
 
     slot = load_provider_slots(
-        {"DEBATE_PROVIDER_1_NAME": "t", "DEBATE_PROVIDER_1_BASE_URL": raw}
-    )["t"]
+        {"DEBATE_PROVIDER_1_NAME": "t", "DEBATE_PROVIDER_1_BASE_URL": raw}, env_file=None
+    ).get("t")
     p = OpenAICompatProvider(slot, transport=httpx.MockTransport(handler))
     await p.chat(REQ)
     assert seen["url"] == "https://x.test/v1/chat/completions"
@@ -237,8 +237,9 @@ async def test_base_url_missing_v1_produces_wrong_path():
         return httpx.Response(200, json={"choices": [{"message": {"content": "x"}}], "usage": {}})
 
     slot = load_provider_slots(
-        {"DEBATE_PROVIDER_1_NAME": "t", "DEBATE_PROVIDER_1_BASE_URL": "https://x.test"}
-    )["t"]
+        {"DEBATE_PROVIDER_1_NAME": "t", "DEBATE_PROVIDER_1_BASE_URL": "https://x.test"},
+        env_file=None,
+    ).get("t")
     await OpenAICompatProvider(slot, transport=httpx.MockTransport(handler)).chat(REQ)
     assert seen["url"] == "https://x.test/chat/completions"  # /v1 이 없음
 

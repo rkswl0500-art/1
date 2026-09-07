@@ -195,15 +195,16 @@ async def _cmd_models(args: argparse.Namespace) -> int:
             print(m)
         return 0
 
-    slots = load_provider_slots()
-    if name not in slots:
+    registry = load_provider_slots()
+    if name not in registry:
         raise ConfigError(
-            f"프로바이더 {name!r} 가 .env 에 없습니다. "
-            f"사용 가능: {', '.join(sorted(slots)) or '<없음>'}"
+            f"프로바이더 {name!r} 를 찾을 수 없습니다.\n  {registry.source_hint()}"
         )
     from .provider import OpenAICompatProvider
 
-    provider = OpenAICompatProvider(slots[name], timeout_s=settings.request_timeout_s)
+    provider = OpenAICompatProvider(
+        registry.get(name), timeout_s=settings.request_timeout_s
+    )
     try:
         for m in await provider.list_models():
             print(m)
@@ -236,7 +237,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     meter = CostMeter(pricing, debate_id="pending")
     pool = build_pool(
         specs,
-        {} if fake else load_provider_slots(),
+        None if fake else load_provider_slots(),
         meter,
         settings,
         fake=_build_fake(specs, args.fake_latency) if fake else None,

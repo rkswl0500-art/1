@@ -23,7 +23,7 @@ from typing import Iterable, Literal, Mapping, Protocol, Sequence, runtime_check
 
 import httpx
 
-from .config import FAKE_PROVIDER, ProviderSlot, Settings
+from .config import FAKE_PROVIDER, ProviderRegistry, ProviderSlot, Settings
 from .cost import CostMeter, estimate_tokens
 from .models import AgentSpec, ChatRequest, ChatResponse, ConfigError, Usage
 
@@ -400,7 +400,7 @@ class ProviderPool:
 
 def build_pool(
     specs: Sequence[AgentSpec],
-    slots: Mapping[str, ProviderSlot],
+    registry: ProviderRegistry | None,
     meter: CostMeter,
     settings: Settings,
     *,
@@ -420,18 +420,20 @@ def build_pool(
         )
         return ProviderPool({name: wrapped for name in wanted | {FAKE_PROVIDER}})
 
-    missing = sorted(wanted - set(slots))
+    if registry is None:
+        raise ConfigError("실제 프로바이더로 돌리려면 레지스트리가 필요합니다")
+
+    missing = sorted(wanted - set(registry.names()))
     if missing:
-        available = ", ".join(sorted(slots)) or "<없음>"
         raise ConfigError(
-            f"참가자가 참조하는 프로바이더가 .env 에 없습니다: {', '.join(missing)}. "
-            f"사용 가능: {available}"
+            f"참가자가 참조하는 프로바이더를 찾을 수 없습니다: {', '.join(missing)}\n"
+            f"  {registry.source_hint()}"
         )
 
     built: dict[str, ChatProvider] = {}
     for name in sorted(wanted):
         raw = OpenAICompatProvider(
-            slots[name],
+            registry.get(name),
             timeout_s=settings.request_timeout_s,
             max_connections=max(settings.max_concurrency, 1),
         )

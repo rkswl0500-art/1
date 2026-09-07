@@ -145,6 +145,12 @@ DEBATE_PROVIDER_1_API_KEY=sk-...                 # 실제 키
 `BASE_URL` 은 **`/v1` 까지만** 씁니다. 끝 슬래시는 있어도 없어도 같습니다
 (`/v1` 과 `/v1/` 모두 정상). `/chat/completions` 는 코드가 붙이므로 쓰지 마세요.
 
+**`.env` 는 명령을 실행하는 디렉터리에서 찾습니다.** 프로젝트 루트에서 돌리세요.
+못 찾으면 에러가 어느 절대 경로를 봤는지 알려줍니다.
+
+BOM 은 신경 쓰지 않아도 됩니다. PowerShell 의 `Out-File -Encoding utf8` 은 기본으로
+BOM 을 붙이는데, `.env` 를 utf-8-sig 로 읽으므로 있든 없든 동작합니다.
+
 ### 1단계 — 연결과 인증
 
 ```bash
@@ -224,7 +230,8 @@ wall 2,118ms | sum(ok=2) 3,946ms | max 2,104ms | failed=0 | waves 1
 | `FatalError: 404` + `model ... does not exist` | 모델 ID 오타 | 1단계 출력에서 그대로 복사 |
 | `FatalError: 404` + 그 외 | `BASE_URL` 에 `/v1` 누락 | `https://host/v1` 형태로 수정 |
 | 요청이 `/v1/chat/completions/chat/completions` 로 감 | `BASE_URL` 에 `/chat/completions` 를 포함시킴 | `/v1` 까지만 남기기 |
-| `ConfigError: 프로바이더 ... .env 에 없습니다` | `--agent` 의 이름 ≠ `DEBATE_PROVIDER_*_NAME` | 두 값을 일치시키기 |
+| `프로바이더를 찾을 수 없습니다` + `사용 가능: <없음>` + `이 경로에 파일이 없습니다` | 프로젝트 루트가 아닌 곳에서 실행 | 에러가 찍은 경로에 `.env` 를 두거나 루트에서 실행 |
+| `프로바이더를 찾을 수 없습니다` + `사용 가능: gemini` | `--agent` 의 이름 ≠ `DEBATE_PROVIDER_*_NAME` | 두 값을 일치시키기 (에러가 인식된 이름을 보여줍니다) |
 | `RetryableError: 3회 시도 모두 실패` + `429` | 레이트리밋 | `--max-concurrency 1` 로 재시도 |
 | `in=0 out=0` 인데 성공 | 엔드포인트가 `usage` 미제공 | 보고 필요 (위 3단계 참조) |
 
