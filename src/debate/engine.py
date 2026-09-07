@@ -122,7 +122,9 @@ class DebateEngine:
             round_no=round_no,
             utterances=tuple(utterances),
             wall_ms=wall_ms,
-            sum_latency_ms=sum(u.latency_ms for u in utterances),
+            # 성공분만 합산합니다. 실패한 발언(latency 0)을 섞으면 wall > sum 이
+            # 되어 병렬성 지표가 거꾸로 읽힙니다.
+            sum_latency_ms=sum(u.latency_ms for u in utterances if u.status == "ok"),
             waves=math.ceil(len(agents) / max(1, cfg.max_concurrency)),
         )
         return result, failures

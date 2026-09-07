@@ -206,3 +206,49 @@ def test_known_zero_price_differs_from_unknown_price():
     assert t.cost_for("free", Usage(100, 100)) == (Decimal(0), True)
     assert t.cost_for("mystery", Usage(100, 100)) == (Decimal(0), False)
     assert t.unpriced_models == ("mystery",)
+
+
+# ── base_url 정규화 (README 의 흔한 실패 항목) ───────────────────────────────
+
+
+@pytest.mark.parametrize("raw", ["https://x.test/v1", "https://x.test/v1/"])
+async def test_trailing_slash_in_base_url_is_harmless(raw):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "x"}}], "usage": {}})
+
+    slot = load_provider_slots(
+        {"DEBATE_PROVIDER_1_NAME": "t", "DEBATE_PROVIDER_1_BASE_URL": raw}
+    )["t"]
+    p = OpenAICompatProvider(slot, transport=httpx.MockTransport(handler))
+    await p.chat(REQ)
+    assert seen["url"] == "https://x.test/v1/chat/completions"
+
+
+async def test_base_url_missing_v1_produces_wrong_path():
+    """BASE_URL 에 /v1 을 빠뜨리면 404 가 납니다. 문서에 적어둔 실패 원인이
+    실제로 그렇게 동작하는지 고정해 둡니다."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "x"}}], "usage": {}})
+
+    slot = load_provider_slots(
+        {"DEBATE_PROVIDER_1_NAME": "t", "DEBATE_PROVIDER_1_BASE_URL": "https://x.test"}
+    )["t"]
+    await OpenAICompatProvider(slot, transport=httpx.MockTransport(handler)).chat(REQ)
+    assert seen["url"] == "https://x.test/chat/completions"  # /v1 이 없음
+
+
+async def test_response_without_usage_yields_zero_tokens():
+    """usage 를 안 주는 엔드포인트가 있습니다. 죽지는 않지만 집계가 0 이 되므로
+    CLI 가 이를 감지해 경고해야 합니다(test_cli 참조)."""
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "답"}}]})
+
+    resp = await _provider(handler).chat(REQ)
+    assert resp.usage == Usage(0, 0)
+    assert resp.text == "답"

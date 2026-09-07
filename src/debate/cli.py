@@ -132,10 +132,11 @@ def _print_result(result: DebateResult, meter: CostMeter) -> None:
                 print(f"  {line}")
             print()
 
-        longest = max((u.latency_ms for u in rnd.utterances), default=0)
         print(
-            f"wall {_n(rnd.wall_ms)}ms | sum {_n(rnd.sum_latency_ms)}ms | "
-            f"max {_n(longest)}ms | waves {rnd.waves}"
+            f"wall {_n(rnd.wall_ms)}ms | "
+            f"sum(ok={rnd.ok_count}) {_n(rnd.sum_latency_ms)}ms | "
+            f"max {_n(rnd.max_latency_ms)}ms | "
+            f"failed={rnd.failed_count} | waves {rnd.waves}"
         )
 
     if result.dropped:
@@ -151,6 +152,36 @@ def _print_result(result: DebateResult, meter: CostMeter) -> None:
     if rep.unpriced_models:
         line += f"  (가격 미상: {', '.join(rep.unpriced_models)} — 0 으로 계상)"
     print(line)
+
+    _print_diagnosis(result, rep)
+
+
+def _print_diagnosis(result: DebateResult, rep) -> None:
+    """라이브 스모크에서 헛다리를 짚지 않게 하는 힌트.
+
+    두 경우가 조용히 지나가기 쉬워서 명시적으로 짚어줍니다:
+      - FatalError 는 재시도로 안 풀리는 설정 문제인데, 참가자 단위로 격리되는
+        바람에 헤드라인이 "참가자 부족"으로 보입니다. 실제 원인은 키/모델 ID 입니다.
+      - usage 를 안 돌려주는 엔드포인트는 토큰이 0 으로 집계되는데 종료 코드는
+        0 입니다. 비용 추적이 조용히 죽는 유일한 경로입니다.
+    """
+    fatal = [
+        u for r in result.rounds for u in r.utterances
+        if u.status == "failed" and "FatalError" in (u.error or "")
+    ]
+    if fatal:
+        print(
+            "\n힌트: FatalError 는 재시도로 해결되지 않는 설정 문제입니다.\n"
+            "      401/403 → API_KEY, 404 → 모델 ID 오타 또는 BASE_URL 경로.\n"
+            "      .env 의 DEBATE_PROVIDER_*_{API_KEY,BASE_URL} 과 모델 ID 를 확인하세요."
+        )
+
+    if rep.calls and rep.total_tokens == 0:
+        print(
+            "\n힌트: 호출은 성공했는데 토큰이 0 입니다. 이 엔드포인트가 응답에 usage 를\n"
+            "      담지 않는 것으로 보입니다. 비용/토큰 집계가 전부 0 이 되므로\n"
+            "      슬라이스 3 의 견적·원장을 신뢰할 수 없습니다. 보고해 주세요."
+        )
 
 
 # ── 커맨드 ───────────────────────────────────────────────────────────────────

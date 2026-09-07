@@ -185,3 +185,58 @@ def test_header_uses_anon_label_and_never_the_model_id():
 
 async def _collect(bucket: list, event) -> None:
     bucket.append(event)
+
+
+# ── 병렬성 지표의 해석 가능성 ────────────────────────────────────────────────
+
+
+async def test_sum_counts_only_successful_utterances():
+    """실패한 발언을 합계에 넣으면 병렬성 지표가 거꾸로 읽힙니다.
+
+    재시도로 시간을 태우고 죽은 참가자가 있으면 wall 은 커지는데 실패 발언의
+    latency 는 0 이라, 합계에 섞는 순간 wall > sum 이 되어 병렬로 잘 돈 라운드가
+    직렬처럼 보입니다. sum 은 성공분만 세고 failed_count 를 따로 읽어야 합니다.
+    """
+    agents, specs, _ = _agents({
+        "ok1": FakeBehavior(latency_ms=120),
+        "boom": FakeBehavior(latency_ms=120, fail_always=True),
+        "ok2": FakeBehavior(latency_ms=120),
+    })
+    rnd = (await DebateEngine(agents).run(_cfg(specs, max_concurrency=3))).rounds[0]
+
+    assert rnd.ok_count == 2
+    assert rnd.failed_count == 1
+    assert len(rnd.utterances) == 3          # 실패도 기록에는 남습니다
+
+    # 성공한 두 건만 합산 — 실패의 0ms 가 섞이지 않음
+    assert rnd.sum_latency_ms == sum(u.latency_ms for u in rnd.ok_utterances)
+    assert rnd.sum_latency_ms >= 240
+    assert rnd.max_latency_ms >= 120
+    # 지표가 바로 읽힘: 성공분 합이 벽시계보다 크다 = 병렬
+    assert rnd.sum_latency_ms > rnd.wall_ms
+
+
+async def test_counts_are_consistent_when_nothing_fails():
+    agents, specs, _ = _agents({
+        "a": FakeBehavior(latency_ms=80), "b": FakeBehavior(latency_ms=80),
+    })
+    rnd = (await DebateEngine(agents).run(_cfg(specs, max_concurrency=2))).rounds[0]
+
+    assert (rnd.ok_count, rnd.failed_count) == (2, 0)
+    assert rnd.sum_latency_ms == sum(u.latency_ms for u in rnd.utterances)
+    assert rnd.max_latency_ms == max(u.latency_ms for u in rnd.utterances)
+
+
+async def test_all_failed_round_reports_zero_sum_not_a_crash():
+    """전원 실패해도 max()/sum() 이 빈 시퀀스로 터지지 않아야 합니다."""
+    agents, specs, _ = _agents({
+        "x": FakeBehavior(latency_ms=10, fail_always=True),
+        "y": FakeBehavior(latency_ms=10, fail_always=True),
+    })
+    result = await DebateEngine(agents).run(_cfg(specs))
+    rnd = result.rounds[0]
+
+    assert (rnd.ok_count, rnd.failed_count) == (0, 2)
+    assert rnd.sum_latency_ms == 0
+    assert rnd.max_latency_ms == 0
+    assert result.status == "aborted_insufficient_participants"

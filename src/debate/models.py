@@ -162,10 +162,32 @@ class RoundResult:
     utterances: tuple[Utterance, ...]
     #: 라운드 전체 벽시계 시간.
     wall_ms: int
-    #: 개별 지연의 단순 합. wall_ms 와 비교하면 병렬 여부가 눈에 보입니다.
+    #: **성공한** 발언들의 지연 합. wall_ms 와 비교하면 병렬 여부가 보입니다.
+    #:
+    #: 실패한 발언은 latency 가 0 이라 합계에 넣으면 지표가 거꾸로 읽힙니다 —
+    #: 재시도로 3초를 태우고 죽은 참가자가 있으면 wall 은 크고 sum 은 작아져서,
+    #: 병렬로 잘 돌았는데도 직렬처럼 보입니다. 그래서 성공분만 세고, 실패 건수는
+    #: failed_count 로 따로 읽습니다. 둘을 같이 봐야 해석이 됩니다.
     sum_latency_ms: int
     #: ceil(참가자수 / 동시성). 세마포어 때문에 wall 이 max 보다 큰 이유.
     waves: int
+
+    @property
+    def ok_utterances(self) -> tuple[Utterance, ...]:
+        return tuple(u for u in self.utterances if u.status == "ok")
+
+    @property
+    def ok_count(self) -> int:
+        return len(self.ok_utterances)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.utterances) - self.ok_count
+
+    @property
+    def max_latency_ms(self) -> int:
+        """성공한 발언 중 가장 느린 것. 웨이브가 1이면 wall 의 하한입니다."""
+        return max((u.latency_ms for u in self.ok_utterances), default=0)
 
 
 DebateStatus = Literal["completed", "aborted_insufficient_participants"]
