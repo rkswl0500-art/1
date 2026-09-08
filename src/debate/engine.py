@@ -1,12 +1,12 @@
 """DebateEngine.
 
 라운드 내부는 병렬, 라운드 간은 순차입니다. 동시 실행 수는 세마포어로
-제한하므로 참가자 5명 / 동시성 3 이면 한 라운드가 2 웨이브로 돕니다 —
-벽시계 시간이 max(지연)이 아니라 대략 웨이브 수 × max(지연)이 되는 이유입니다.
+제한하므로 참가자 5명 / 동시성 3 이면 한 라운드가 2 웨이브로 돕니다.
 
-슬라이스 1 범위: 1라운드. 다라운드는 ContextBuilder(슬라이스 2)가 있어야
-의미가 있으므로 rounds > 1 이면 명시적으로 거부합니다 — 조용히 빈 컨텍스트로
-2라운드를 돌려 쓰레기를 만드느니 죽는 게 낫습니다.
+라운드 사이에 세 가지가 일어납니다:
+  R1 직후      사회자가 쟁점 3~5개를 뽑습니다. 이후 라운드는 그 안에서만.
+  매 라운드 전   InterventionGate 가 사람의 지시를 수집합니다(기본 no-op).
+  R2 이후      직전의 직전 라운드를 요약본에 접습니다 — 컨텍스트 예산 관리.
 """
 
 from __future__ import annotations
@@ -15,20 +15,24 @@ import asyncio
 import math
 import time
 import uuid
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, Protocol, Sequence
 
-from .agent import Agent, build_header
+from .agent import Agent, Anonymizer, Moderator
+from .context import ContextBuilder
 from .models import (
     AgentDropped,
-    ContextPack,
     DebateCompleted,
     DebateConfig,
     DebateEvent,
     DebateResult,
     DebateStarted,
+    DebateState,
+    Directive,
+    IssuesExtracted,
     RoundCompleted,
     RoundResult,
     RoundStarted,
+    RoundSummarized,
     Utterance,
     UtteranceCompleted,
 )
@@ -36,36 +40,67 @@ from .models import (
 EventSink = Callable[[DebateEvent], Awaitable[None]]
 
 
+class InterventionGate(Protocol):
+    """라운드 사이에 사람의 지시를 받는 자리.
+
+    엔진은 이게 즉시 반환하는지 사람을 기다리는지 모릅니다. CLI 는 no-op 을,
+    슬라이스 4 의 API 는 실제 대기를 꽂습니다. 지시는 **1회용**이라 수집된
+    라운드에만 적용되고, 이후에는 요약본에 한 줄 흔적으로만 남습니다.
+    """
+
+    async def collect(self, round_no: int, state: DebateState) -> tuple[Directive, ...]: ...
+
+
+class NoIntervention:
+    """기본 게이트. 아무도 기다리지 않고 빈 튜플을 돌려줍니다."""
+
+    async def collect(self, round_no: int, state: DebateState) -> tuple[Directive, ...]:
+        return ()
+
+
 async def _noop_sink(_: DebateEvent) -> None:
     return None
 
 
 class DebateEngine:
-    def __init__(self, agents: Sequence[Agent], *, sink: EventSink | None = None) -> None:
+    def __init__(
+        self,
+        agents: Sequence[Agent],
+        builder: ContextBuilder,
+        moderator: Moderator,
+        anonymizer: Anonymizer,
+        *,
+        gate: InterventionGate | None = None,
+        sink: EventSink | None = None,
+    ) -> None:
         if len(agents) < 2:
             raise ValueError("참가자는 최소 2명이어야 합니다")
         self._agents = list(agents)
+        self._builder = builder
+        self._moderator = moderator
+        self._anon = anonymizer
+        self._gate = gate or NoIntervention()
         self._sink = sink or _noop_sink
 
     async def run(self, cfg: DebateConfig) -> DebateResult:
-        if cfg.rounds != 1:
-            raise NotImplementedError(
-                f"슬라이스 1 은 1라운드만 지원합니다 (요청: {cfg.rounds}). "
-                "다라운드는 ContextBuilder 가 붙는 슬라이스 2 범위입니다."
-            )
-
         debate_id = f"d_{uuid.uuid4().hex[:6]}"
         specs = tuple(a.spec for a in self._agents)
-        await self._sink(DebateStarted(debate_id, cfg.topic, specs, cfg.rounds))
-
-        rounds: list[RoundResult] = []
+        state = DebateState(topic=cfg.topic)
+        warnings: list[str] = []
         dropped: list[str] = []
         alive = list(self._agents)
 
+        await self._sink(DebateStarted(debate_id, cfg.topic, specs, cfg.rounds))
+
         for round_no in range(1, cfg.rounds + 1):
+            state.round_no = round_no
+            state.directives = await self._gate.collect(round_no, state)
+            for directive in state.directives:
+                state.directive_trace.append((round_no, directive.text))
+
             await self._sink(RoundStarted(round_no, tuple(a.id for a in alive)))
-            result, failures = await self._run_round(round_no, alive, cfg)
-            rounds.append(result)
+            result, failures = await self._run_round(round_no, alive, cfg, state)
+            state.completed_rounds.append(result)
 
             for agent, err in failures:
                 dropped.append(agent.id)
@@ -73,32 +108,88 @@ class DebateEngine:
                     AgentDropped(agent.id, round_no, f"{type(err).__name__}: {err}")
                 )
             if failures:
-                failed_ids = {a.id for a, _ in failures}
-                alive = [a for a in alive if a.id not in failed_ids]
+                failed = {a.id for a, _ in failures}
+                alive = [a for a in alive if a.id not in failed]
 
             await self._sink(RoundCompleted(result))
+            state.directives = ()          # 1회용: 다음 라운드로 넘기지 않습니다
 
             if len(alive) < 2:
-                out = DebateResult(
-                    debate_id, cfg.topic, specs, tuple(rounds),
-                    status="aborted_insufficient_participants", dropped=tuple(dropped),
+                return await self._finish(
+                    debate_id, cfg, specs, state, dropped, warnings,
+                    status="aborted_insufficient_participants",
                 )
-                await self._sink(DebateCompleted(out))
-                return out
 
+            if round_no < cfg.rounds:
+                await self._between_rounds(round_no, state, warnings)
+
+        return await self._finish(debate_id, cfg, specs, state, dropped, warnings)
+
+    async def _between_rounds(
+        self, round_no: int, state: DebateState, warnings: list[str]
+    ) -> None:
+        """쟁점 추출(R1 직후)과 요약 접기(R2 이후).
+
+        둘 다 실패해도 토론은 계속합니다 — 사회자가 한 번 삐끗했다고 진행된
+        라운드를 버리는 건 과잉입니다. 대신 경고로 남겨서 조용히 넘어가지
+        않게 합니다.
+        """
+        if round_no == 1:
+            try:
+                first = state.completed_rounds[0]
+                anon = tuple(
+                    self._anon.to_anon(u) for u in first.utterances if u.status == "ok"
+                )
+                state.issues = await self._moderator.extract_issues(state.topic, anon)
+                await self._sink(IssuesExtracted(state.issues))
+            except Exception as e:                      # noqa: BLE001
+                warnings.append(
+                    f"쟁점 추출 실패 ({type(e).__name__}: {e}). "
+                    "이후 라운드가 쟁점 제약 없이 진행됩니다."
+                )
+            return
+
+        # R_n 을 마쳤으면 R_(n-1) 을 요약본에 접습니다. 그래야 다음 라운드가
+        # 직전 전문(R_n) + 그 이전 요약(R_1..R_(n-1)) 형태가 됩니다.
+        target = state.completed_rounds[round_no - 2]
+        try:
+            state.prior_digest = await self._moderator.summarize(
+                state.prior_digest, target, self._anon.to_anon,
+                directive_trace=tuple(state.directive_trace),
+            )
+            await self._sink(RoundSummarized(target.round_no, state.prior_digest))
+        except Exception as e:                          # noqa: BLE001
+            warnings.append(
+                f"R{target.round_no} 요약 실패 ({type(e).__name__}: {e}). "
+                "이전 요약을 그대로 유지합니다."
+            )
+
+    async def _finish(
+        self, debate_id, cfg, specs, state, dropped, warnings, *, status="completed",
+    ) -> DebateResult:
         out = DebateResult(
-            debate_id, cfg.topic, specs, tuple(rounds), dropped=tuple(dropped)
+            debate_id=debate_id,
+            topic=cfg.topic,
+            participants=specs,
+            rounds=tuple(state.completed_rounds),
+            status=status,
+            dropped=tuple(dropped),
+            issues=state.issues,
+            warnings=tuple(warnings),
         )
         await self._sink(DebateCompleted(out))
         return out
 
     async def _run_round(
-        self, round_no: int, agents: Sequence[Agent], cfg: DebateConfig
+        self, round_no: int, agents: Sequence[Agent], cfg: DebateConfig,
+        state: DebateState,
     ) -> tuple[RoundResult, list[tuple[Agent, BaseException]]]:
         sem = asyncio.Semaphore(max(1, cfg.max_concurrency))
 
         async def one(agent: Agent) -> Utterance:
-            ctx = self._context_for(agent, round_no, cfg)
+            # 팩은 세마포어 밖에서 만듭니다 — state 는 이 시점에 이미 확정본이고,
+            # 대기 중에 바뀌지 않습니다.
+            ctx = self._builder.build_for(agent.spec, state)
             async with sem:
                 utterance = await asyncio.wait_for(agent.speak(ctx), cfg.round_timeout_s)
             # gather 가 끝난 뒤가 아니라 **완료 즉시** 방출합니다. 뒤로 미루면
@@ -132,11 +223,3 @@ class DebateEngine:
             waves=math.ceil(len(agents) / max(1, cfg.max_concurrency)),
         )
         return result, failures
-
-    def _context_for(self, agent: Agent, round_no: int, cfg: DebateConfig) -> ContextPack:
-        """슬라이스 1: 헤더만. 진행 중인 라운드는 구조상 참조 불가입니다.
-
-        슬라이스 2 에서 이 자리를 ContextBuilder.build_for() 가 대체하며,
-        확정된 이전 라운드(state.completed_rounds)만 읽는 불변식을 유지합니다.
-        """
-        return ContextPack(header=build_header(agent.spec, cfg.topic), round_no=round_no)

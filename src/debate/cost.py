@@ -78,6 +78,7 @@ class CostMeter:
         latency_ms: int,
         attempts: int = 1,
         finish_reason: str | None = None,
+        round_no: int | None = None,
     ) -> CallRecord:
         cost, priced = self._pricing.cost_for(model, usage)
         rec = CallRecord(
@@ -93,6 +94,7 @@ class CostMeter:
             priced=priced,
             attempts=attempts,
             finish_reason=finish_reason,
+            round_no=round_no,
         )
         self._records.append(rec)
         return rec

@@ -18,13 +18,14 @@ from pathlib import Path
 
 import yaml
 
-from .agent import Agent
+from .agent import Agent, Anonymizer, Moderator
 from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
 from .cost import CostMeter
+from .context import ContextBuilder
 from .engine import DebateEngine
 from .models import (
     AgentDropped, AgentSpec, ConfigError, DebateConfig, DebateResult,
-    RoundStarted, UtteranceCompleted,
+    IssuesExtracted, RoundStarted, RoundSummarized, UtteranceCompleted,
 )
 from .provider import FakeBehavior, FakeProvider, ProviderError, build_pool
 
@@ -98,16 +99,44 @@ def _load_roster(path: Path, *, fake: bool) -> tuple[str, int, list[AgentSpec]]:
     return str(raw.get("topic") or ""), int(raw.get("rounds") or 1), specs
 
 
-def _build_fake(specs: list[AgentSpec], latencies: str | None) -> FakeProvider:
-    """--fake-latency 1800,2100 을 참가자 순서대로 모델에 매핑합니다."""
-    if not latencies:
-        return FakeProvider()
-    values = [int(v) for v in latencies.split(",") if v.strip()]
-    if len(values) != len(specs):
-        raise ConfigError(
-            f"--fake-latency 값이 {len(values)}개인데 참가자는 {len(specs)}명입니다"
+def _build_fake(
+    specs: list[AgentSpec], latencies: str | None,
+    fail_agent: str | None = None, fail_mode: str = "500",
+) -> FakeProvider:
+    """--fake-latency 1800,2100 과 --fail-agent m2@round2 를 행동표로 만듭니다."""
+    values: list[int] = []
+    if latencies:
+        values = [int(v) for v in latencies.split(",") if v.strip()]
+        if len(values) != len(specs):
+            raise ConfigError(
+                f"--fake-latency 값이 {len(values)}개인데 참가자는 {len(specs)}명입니다"
+            )
+
+    rounds: frozenset[int] = frozenset()
+    target = fail_agent
+    if fail_agent and "@" in fail_agent:
+        target, _, spec = fail_agent.partition("@")
+        digits = "".join(ch for ch in spec if ch.isdigit())
+        if not digits:
+            raise ConfigError(
+                f"--fail-agent {fail_agent!r}: '모델@round2' 형식으로 쓰세요"
+            )
+        rounds = frozenset({int(digits)})
+
+    if target and not any(s.model == target or s.id == target for s in specs):
+        known = ", ".join(f"{s.id}={s.model}" for s in specs)
+        raise ConfigError(f"--fail-agent {target!r} 가 참가자에 없습니다. 참가자: {known}")
+
+    behaviors: dict[str, FakeBehavior] = {}
+    for i, spec in enumerate(specs):
+        hit = target is not None and (spec.model == target or spec.id == target)
+        behaviors[spec.model] = FakeBehavior(
+            latency_ms=values[i] if values else 800,
+            fail_mode=fail_mode,  # type: ignore[arg-type]
+            fail_always=hit and not rounds,
+            fail_rounds=rounds if hit else frozenset(),
         )
-    return FakeProvider({s.model: FakeBehavior(latency_ms=v) for s, v in zip(specs, values)})
+    return FakeProvider(behaviors)
 
 
 # ── 출력 ─────────────────────────────────────────────────────────────────────
@@ -151,6 +180,12 @@ class _Progress:
             print(f"  {event.label} 완료 ({_n(u.latency_ms)}ms, "
                   f"{u.usage.completion_tokens}tok)  [{self._done}/{self._active}]",
                   flush=True)
+        elif isinstance(event, IssuesExtracted):
+            print(f"\n쟁점 ({len(event.issues)}):", flush=True)
+            for n, issue in enumerate(event.issues, start=1):
+                print(f"  {n}) {issue.title}", flush=True)
+        elif isinstance(event, RoundSummarized):
+            print(f"  [R{event.round_no} 요약 접힘, {len(event.digest)}자]", flush=True)
         elif isinstance(event, AgentDropped):
             print(f"  {self._labels.get(event.agent_id, event.agent_id)} 드롭 — "
                   f"{event.reason}", flush=True)
@@ -191,6 +226,31 @@ def _make_dump(dump_dir: str | None):
     return dump
 
 
+def _preview_context(builder, specs, cfg) -> None:
+    """가짜 상태로 마지막 라운드 컨텍스트를 미리 찍어 눈으로 검사하게 합니다.
+
+    라운드 내 블라인드는 눈으로 확인할 수 있어야 믿을 수 있습니다 — 테스트는
+    불변식을 지키지만, 프롬프트가 실제로 어떻게 보이는지는 사람이 봐야 합니다.
+    """
+    from .models import AnonUtterance, DebateState, Issue, RoundResult, Usage, Utterance
+
+    state = DebateState(topic=cfg.topic, round_no=cfg.rounds)
+    state.issues = tuple(Issue(f"i{n}", f"<쟁점 {n} 자리>") for n in range(1, 4))
+    state.prior_digest = "<R1..R(n-2) 요약 자리>"
+    state.completed_rounds = [RoundResult(
+        cfg.rounds - 1,
+        tuple(Utterance(s.id, cfg.rounds - 1, f"<{s.label} 의 직전 라운드 발언>",
+                        Usage(0, 0), 0, Decimal(0)) for s in specs),
+        0, 0, 1,
+    )]
+    pack = builder.build_for(specs[0], state)
+    print(f"\n{'='*70}\n{specs[0].label} 에게 갈 R{cfg.rounds} 컨텍스트 (미리보기)\n{'='*70}")
+    for msg in pack.render():
+        print(f"--- {msg.role} ---")
+        print(msg.content)
+    print("=" * 70)
+
+
 def _print_result(result: DebateResult, meter: CostMeter) -> None:
     labels = {s.id: s.label for s in result.participants}
     models = {s.id: f"{s.provider}/{s.model}" for s in result.participants}
@@ -217,8 +277,13 @@ def _print_result(result: DebateResult, meter: CostMeter) -> None:
             f"failed={rnd.failed_count} | waves {rnd.waves}"
         )
 
+    if result.issues:
+        print(f"\n확정된 쟁점 {len(result.issues)}개: "
+              + " | ".join(i.title for i in result.issues))
     if result.dropped:
         print(f"dropout: {', '.join(result.dropped)}")
+    for warning in result.warnings:
+        print(f"경고: {warning}")
     if result.status != "completed":
         print(f"status: {result.status}")
 
@@ -332,7 +397,8 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         None if fake else load_provider_slots(),
         meter,
         settings,
-        fake=_build_fake(specs, args.fake_latency) if fake else None,
+        fake=_build_fake(specs, args.fake_latency, args.fail_agent,
+                         args.fail_mode) if fake else None,
         dump=_make_dump(args.dump_raw),
     )
 
@@ -361,9 +427,20 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     if warning:
         print(f"주의: {warning}")
 
+    anonymizer = Anonymizer(specs)
+    builder = ContextBuilder(anonymizer)
+    moderator_model = args.moderator or specs[0].model
+    moderator = Moderator(pool.get(specs[0].provider), moderator_model,
+                          timeout_s=settings.request_timeout_s)
+
+    if args.show_context:
+        _preview_context(builder, specs, cfg)
+
     progress = _Progress({s.id: s.label for s in specs}, concurrency)
     try:
-        result = await DebateEngine(agents, sink=progress).run(cfg)
+        result = await DebateEngine(
+            agents, builder, moderator, anonymizer, sink=progress
+        ).run(cfg)
     finally:
         await pool.aclose()
 
@@ -394,6 +471,11 @@ def main(argv: list[str] | None = None) -> int:
         help="fake 를 주면 실제 호출 없이 결정론적 가짜로 돌립니다",
     )
     r.add_argument("--fake-latency", help="fake 모드 참가자별 지연(ms), 콤마 구분")
+    r.add_argument("--show-context", action="store_true",
+                   help="마지막 라운드 컨텍스트를 실행 전에 출력")
+    r.add_argument("--moderator", help="쟁점 추출·요약에 쓸 모델 (기본: 첫 참가자)")
+    r.add_argument("--fail-agent", help="fake 모드 장애 주입: '모델' 또는 '모델@round2'")
+    r.add_argument("--fail-mode", default="500", choices=["500", "429", "timeout", "fatal"])
     r.add_argument(
         "--dump-raw", metavar="DIR",
         help="프로바이더 원본 JSON 응답을 이 디렉터리에 저장 (헤더/키는 저장 안 함)",

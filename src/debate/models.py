@@ -35,6 +35,12 @@ class ChatRequest:
     timeout_s: float = 120.0
     #: 원장 귀속용 자유 태그(보통 agent_id). 프로바이더는 무시합니다.
     tag: str | None = None
+    #: 이 호출의 용도. 같은 프로바이더 인스턴스를 토론/쟁점/요약이 공유하므로
+    #: 용도는 호출마다 실려야 합니다 — 생성 시점에 고정하면 사회자 호출이
+    #: 전부 'debate' 로 기록됩니다.
+    purpose: CallPurpose = "debate"
+    #: 몇 번째 라운드의 호출인지. 원장 조회와 fake 장애 주입에 씁니다.
+    round_no: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +116,26 @@ class Issue:
     title: str
 
 
+@dataclass(frozen=True, slots=True)
+class Directive:
+    """토론 중간에 사람이 넣는 지시.
+
+    **1회용입니다.** 지정된 라운드의 컨텍스트에만 들어가고, 그 다음부터는
+    요약본에 "사회자가 X를 지시함" 한 줄로만 남습니다. 누적하면 라운드가
+    갈수록 지시문이 헤더처럼 쌓여 컨텍스트 예산을 먹습니다.
+
+    v1 은 전체 브로드캐스트만 지원합니다 — 참가자별 개별 지시는 컨텍스트를
+    참가자마다 갈라놓아서, Judge 가 "왜 이 참가자만 이 얘길 하지"를 판단할
+    근거를 잃습니다.
+
+    투입은 슬라이스 4 입니다. 지금은 항상 비어 있습니다.
+    """
+
+    text: str
+    round_no: int
+    source: str = "human"
+
+
 # ── Context ──────────────────────────────────────────────────────────────────
 
 
@@ -127,6 +153,8 @@ class ContextPack:
     issues: tuple[Issue, ...] = ()
     prior_digest: str = ""
     last_round: tuple[AnonUtterance, ...] = ()
+    #: 이번 라운드에 한해 적용되는 사람의 지시. 슬라이스 4 에서 채워집니다.
+    directives: tuple[Directive, ...] = ()
 
     def render(self) -> tuple[Message, ...]:
         parts: list[str] = []
@@ -141,6 +169,14 @@ class ContextPack:
         if self.last_round:
             said = "\n\n".join(f"{u.label}:\n{u.content}" for u in self.last_round)
             parts.append(f"[직전 라운드 발언 전문]\n{said}")
+
+        if self.directives:
+            listed = "\n".join(f"  - {d.text}" for d in self.directives)
+            # 쟁점 뒤, 차례 지시 앞. 쟁점보다 앞에 두면 배경으로 읽히고,
+            # 차례 지시 뒤에 두면 무시됩니다.
+            parts.append(
+                f"[사회자 지시] 이번 라운드에 한해 아래를 반드시 반영하십시오.\n{listed}"
+            )
 
         parts.append(
             f"[당신의 차례] 제{self.round_no}라운드 발언을 작성하십시오."
@@ -197,6 +233,31 @@ class RoundResult:
         return max((u.latency_ms for u in self.ok_utterances), default=0)
 
 
+@dataclass(slots=True)
+class DebateState:
+    """토론의 확정된 상태.
+
+    **진행 중인 라운드를 담을 필드가 없습니다.** 이게 "같은 라운드 참가자는
+    서로 못 본다"를 보장하는 방식입니다 — ContextBuilder 는 이 객체만 읽으므로,
+    아직 커밋되지 않은 발언에 접근할 경로가 타입 상 존재하지 않습니다.
+    """
+
+    topic: str
+    round_no: int = 1
+    completed_rounds: list[RoundResult] = field(default_factory=list)
+    issues: tuple[Issue, ...] = ()
+    #: 직전 라운드를 뺀 그 이전 라운드들의 압축본.
+    prior_digest: str = ""
+    #: 이번 라운드에만 적용되는 지시. 라운드가 끝나면 비워집니다.
+    directives: tuple[Directive, ...] = ()
+    #: 요약본에 흔적으로 남길 지시 이력 (라운드번호, 요지).
+    directive_trace: list[tuple[int, str]] = field(default_factory=list)
+
+    @property
+    def last_round(self) -> RoundResult | None:
+        return self.completed_rounds[-1] if self.completed_rounds else None
+
+
 DebateStatus = Literal["completed", "aborted_insufficient_participants"]
 
 
@@ -208,6 +269,10 @@ class DebateResult:
     rounds: tuple[RoundResult, ...]
     status: DebateStatus = "completed"
     dropped: tuple[str, ...] = ()
+    issues: tuple[Issue, ...] = ()
+    #: 치명적이지 않은 문제들(쟁점 추출 실패 등). 토론은 계속되지만 조용히
+    #: 넘어가면 안 되는 것들입니다.
+    warnings: tuple[str, ...] = ()
 
 
 # ── 이벤트 ───────────────────────────────────────────────────────────────────
@@ -243,6 +308,17 @@ class AgentDropped:
 
 
 @dataclass(frozen=True, slots=True)
+class IssuesExtracted:
+    issues: tuple[Issue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RoundSummarized:
+    round_no: int
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class RoundCompleted:
     result: RoundResult
 
@@ -257,6 +333,8 @@ DebateEvent = Union[
     RoundStarted,
     UtteranceCompleted,
     AgentDropped,
+    IssuesExtracted,
+    RoundSummarized,
     RoundCompleted,
     DebateCompleted,
 ]
@@ -278,6 +356,9 @@ class CallRecord:
     priced: bool
     attempts: int = 1
     finish_reason: str | None = None
+    #: 어느 라운드의 호출인지. 슬라이스 3 의 원장 조회가 라운드별 비용을
+    #: 뽑으려면 필요합니다.
+    round_no: int | None = None
 
 
 class ConfigError(Exception):

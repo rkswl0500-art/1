@@ -11,7 +11,8 @@ import time
 
 import pytest
 
-from debate.agent import DEBATE_RULES, Agent, build_header
+from debate.agent import DEBATE_RULES, Agent, Anonymizer, Moderator, build_header
+from debate.context import ContextBuilder
 from debate.config import PricingTable
 from debate.cost import CostMeter
 from debate.engine import DebateEngine
@@ -42,6 +43,14 @@ def _agents(behaviors: dict[str, FakeBehavior], *, attempts: int = 3):
     return [Agent(s, shared, PRICING) for s in specs], specs, meter
 
 
+def _engine(agents, specs, *, sink=None, gate=None, moderator=None):
+    """엔진 조립. 사회자는 첫 참가자와 같은 프로바이더를 씁니다."""
+    anon = Anonymizer(specs)
+    mod = moderator or Moderator(agents[0]._provider, specs[0].model)
+    return DebateEngine(agents, ContextBuilder(anon), mod, anon,
+                        gate=gate, sink=sink)
+
+
 def _cfg(specs, **kw) -> DebateConfig:
     return DebateConfig(topic="원격근무는 생산성을 높이는가",
                         participants=tuple(specs), rounds=1, **kw)
@@ -57,7 +66,7 @@ async def test_round_runs_in_parallel_not_sequentially():
         "m3": FakeBehavior(latency_ms=200),
     })
     started = time.perf_counter()
-    result = await DebateEngine(agents).run(_cfg(specs, max_concurrency=3))
+    result = await _engine(agents, specs).run(_cfg(specs, max_concurrency=3))
     elapsed_ms = (time.perf_counter() - started) * 1000
 
     rnd = result.rounds[0]
@@ -73,7 +82,7 @@ async def test_semaphore_forces_waves():
     판정합니다.
     """
     agents, specs, _ = _agents({f"m{i}": FakeBehavior(latency_ms=100) for i in range(1, 6)})
-    result = await DebateEngine(agents).run(_cfg(specs, max_concurrency=3))
+    result = await _engine(agents, specs).run(_cfg(specs, max_concurrency=3))
     rnd = result.rounds[0]
 
     assert rnd.waves == 2
@@ -91,7 +100,7 @@ async def test_one_agent_failing_does_not_stop_the_debate():
         "ok2": FakeBehavior(latency_ms=10),
     })
     events = []
-    result = await DebateEngine(agents, sink=lambda e: _collect(events, e)).run(
+    result = await _engine(agents, specs, sink=lambda e: _collect(events, e)).run(
         _cfg(specs, max_concurrency=3)
     )
 
@@ -109,7 +118,7 @@ async def test_agent_recovering_within_retry_budget_is_not_dropped():
         "ok": FakeBehavior(latency_ms=10),
         "flaky": FakeBehavior(latency_ms=10, fail_first_n=2),  # 3번째에 성공
     })
-    result = await DebateEngine(agents).run(_cfg(specs))
+    result = await _engine(agents, specs).run(_cfg(specs))
     assert result.dropped == ()
     assert all(u.status == "ok" for u in result.rounds[0].utterances)
     assert max(r.attempts for r in meter.records) == 3
@@ -120,7 +129,7 @@ async def test_debate_aborts_when_fewer_than_two_survive():
         "ok": FakeBehavior(latency_ms=10),
         "boom": FakeBehavior(latency_ms=10, fail_always=True),
     })
-    result = await DebateEngine(agents).run(_cfg(specs))
+    result = await _engine(agents, specs).run(_cfg(specs))
     assert result.status == "aborted_insufficient_participants"
     # 중단돼도 진행된 부분은 남습니다
     assert len(result.rounds) == 1
@@ -132,7 +141,7 @@ async def test_timeout_drops_only_the_hung_agent():
         "hung": FakeBehavior(latency_ms=5000),
         "fast2": FakeBehavior(latency_ms=10),
     })
-    result = await DebateEngine(agents).run(
+    result = await _engine(agents, specs).run(
         _cfg(specs, max_concurrency=3, round_timeout_s=0.3)
     )
     assert result.dropped == ("p2",)
@@ -142,21 +151,14 @@ async def test_timeout_drops_only_the_hung_agent():
 # ── 범위/불변식 ──────────────────────────────────────────────────────────────
 
 
-async def test_multi_round_is_refused_rather_than_silently_wrong():
-    agents, specs, _ = _agents({"a": FakeBehavior(latency_ms=1), "b": FakeBehavior(latency_ms=1)})
-    with pytest.raises(NotImplementedError, match="슬라이스 2"):
-        await DebateEngine(agents).run(
-            DebateConfig(topic="t", participants=tuple(specs), rounds=3)
-        )
-
-
 async def test_round1_context_carries_no_other_participant_content():
     """라운드 내 블라인드. 슬라이스 1 에서는 R1 이라 자명하지만, 이 불변식이
     깨지는 순간을 슬라이스 2 이전에 잡아두려고 지금부터 검사합니다."""
     agents, specs, _ = _agents({"a": FakeBehavior(latency_ms=1), "b": FakeBehavior(latency_ms=1)})
-    engine = DebateEngine(agents)
+    engine = _engine(agents, specs)
     cfg = _cfg(specs)
-    pack = engine._context_for(agents[0], 1, cfg)
+    from debate.models import DebateState
+    pack = engine._builder.build_for(agents[0].spec, DebateState(topic=cfg.topic))
 
     assert pack.last_round == ()
     assert pack.prior_digest == ""
@@ -202,7 +204,7 @@ async def test_sum_counts_only_successful_utterances():
         "boom": FakeBehavior(latency_ms=120, fail_always=True),
         "ok2": FakeBehavior(latency_ms=120),
     })
-    rnd = (await DebateEngine(agents).run(_cfg(specs, max_concurrency=3))).rounds[0]
+    rnd = (await _engine(agents, specs).run(_cfg(specs, max_concurrency=3))).rounds[0]
 
     assert rnd.ok_count == 2
     assert rnd.failed_count == 1
@@ -220,7 +222,7 @@ async def test_counts_are_consistent_when_nothing_fails():
     agents, specs, _ = _agents({
         "a": FakeBehavior(latency_ms=80), "b": FakeBehavior(latency_ms=80),
     })
-    rnd = (await DebateEngine(agents).run(_cfg(specs, max_concurrency=2))).rounds[0]
+    rnd = (await _engine(agents, specs).run(_cfg(specs, max_concurrency=2))).rounds[0]
 
     assert (rnd.ok_count, rnd.failed_count) == (2, 0)
     assert rnd.sum_latency_ms == sum(u.latency_ms for u in rnd.utterances)
@@ -233,10 +235,91 @@ async def test_all_failed_round_reports_zero_sum_not_a_crash():
         "x": FakeBehavior(latency_ms=10, fail_always=True),
         "y": FakeBehavior(latency_ms=10, fail_always=True),
     })
-    result = await DebateEngine(agents).run(_cfg(specs))
+    result = await _engine(agents, specs).run(_cfg(specs))
     rnd = result.rounds[0]
 
     assert (rnd.ok_count, rnd.failed_count) == (0, 2)
     assert rnd.sum_latency_ms == 0
     assert rnd.max_latency_ms == 0
     assert result.status == "aborted_insufficient_participants"
+
+
+# ── 다라운드 (슬라이스 2) ────────────────────────────────────────────────────
+
+
+async def test_dropped_agent_is_excluded_from_every_later_round():
+    agents, specs, _ = _agents({
+        "ok1": FakeBehavior(latency_ms=1),
+        "dies": FakeBehavior(latency_ms=1, fail_rounds=frozenset({2})),
+        "ok2": FakeBehavior(latency_ms=1),
+    })
+    result = await _engine(agents, specs).run(
+        DebateConfig(topic="주제", participants=tuple(specs), rounds=4)
+    )
+
+    assert result.dropped == ("p2",)
+    speakers_by_round = {
+        r.round_no: {u.agent_id for u in r.utterances if u.status == "ok"}
+        for r in result.rounds
+    }
+    assert speakers_by_round[1] == {"p1", "p2", "p3"}
+    assert speakers_by_round[3] == {"p1", "p3"}      # 드롭 이후 아예 호출 안 됨
+    assert speakers_by_round[4] == {"p1", "p3"}
+    assert result.status == "completed"
+
+
+async def test_ledger_separates_debate_issues_and_summary_calls():
+    """같은 프로바이더 인스턴스를 셋이 공유하므로, 용도가 호출마다 실리지 않으면
+    사회자 호출이 전부 'debate' 로 기록됩니다."""
+    agents, specs, meter = _agents({"a": FakeBehavior(latency_ms=1),
+                                    "b": FakeBehavior(latency_ms=1)})
+    await _engine(agents, specs).run(
+        DebateConfig(topic="주제", participants=tuple(specs), rounds=3)
+    )
+
+    purposes = [r.purpose for r in meter.records]
+    assert purposes.count("debate") == 6            # 2명 × 3라운드
+    assert purposes.count("issues") == 1            # R1 직후 1회
+    assert purposes.count("summary") == 1           # R2 직후 R1 을 접음
+    assert all(r.round_no is not None for r in meter.records if r.purpose == "debate")
+
+
+async def test_moderator_failure_warns_but_does_not_kill_the_debate():
+    """사회자가 한 번 삐끗했다고 진행된 라운드를 버리는 건 과잉입니다.
+    다만 조용히 넘어가서도 안 됩니다."""
+    class BrokenModerator:
+        async def extract_issues(self, topic, round1):
+            raise ValueError("쟁점을 3개 이상 뽑지 못했습니다")
+
+        async def summarize(self, prior, round_result, anonymize, **kw):
+            return prior
+
+    agents, specs, _ = _agents({"a": FakeBehavior(latency_ms=1), "b": FakeBehavior(latency_ms=1)})
+    result = await _engine(agents, specs, moderator=BrokenModerator()).run(
+        DebateConfig(topic="주제", participants=tuple(specs), rounds=3)
+    )
+
+    assert result.status == "completed"
+    assert len(result.rounds) == 3
+    assert result.issues == ()
+    assert any("쟁점 추출 실패" in w for w in result.warnings)
+
+
+async def test_digest_folds_one_round_behind_the_verbatim_one():
+    """R_n 컨텍스트 = 쟁점 + R_(n-1) 전문 + R_1..R_(n-2) 요약.
+    요약이 직전 라운드까지 삼키면 전문이 두 번 들어갑니다."""
+    agents, specs, _ = _agents({"a": FakeBehavior(latency_ms=1), "b": FakeBehavior(latency_ms=1)})
+    summarized: list[int] = []
+
+    class SpyModerator(Moderator):
+        async def summarize(self, prior, round_result, anonymize, **kw):
+            summarized.append(round_result.round_no)
+            return await super().summarize(prior, round_result, anonymize, **kw)
+
+    spy = SpyModerator(agents[0]._provider, specs[0].model)
+    await _engine(agents, specs, moderator=spy).run(
+        DebateConfig(topic="주제", participants=tuple(specs), rounds=4)
+    )
+
+    # R2 를 마치면 R1 을, R3 를 마치면 R2 를 접습니다. R4 는 마지막이라 접지 않음.
+    assert summarized == [1, 2]

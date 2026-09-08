@@ -223,6 +223,9 @@ class FakeBehavior:
     fail_first_n: int = 0
     fail_mode: FailMode = "500"
     fail_always: bool = False
+    #: 이 라운드들에서만 실패시킵니다. dropout 이 이후 라운드에 미치는 영향을
+    #: 검증하려면 "R2 에서만 죽는" 참가자가 필요합니다.
+    fail_rounds: frozenset[int] = frozenset()
 
 
 _FAKE_OPENERS = (
@@ -239,6 +242,14 @@ _FAKE_BODIES = (
     "평균값 뒤에 분산이 숨어 있어, 특정 직군에서만 성립하는 효과가 전체 효과로 포장됩니다.",
     "반대 사례가 존재한다는 사실만으로는 일반화를 무너뜨리지 못하며 빈도를 따져야 합니다.",
 )
+#: 사회자(쟁점 추출) 호출에 대한 fake 응답. 실제 모델은 JSON 을 돌려줍니다.
+_FAKE_ISSUES_JSON = """{"issues": [
+  "생산성 측정 지표가 실제 성과를 대리하는가",
+  "전환 비용과 장기 편익 중 어느 구간을 기준으로 볼 것인가",
+  "직군별 편차를 전체 효과로 일반화할 수 있는가",
+  "신입 온보딩과 암묵지 전수에 미치는 영향"
+]}"""
+
 _FAKE_CLOSERS = (
     "따라서 저는 조건부로만 이 주장에 동의합니다.",
     "그러므로 입증 책임은 여전히 반대편에 있습니다.",
@@ -272,7 +283,8 @@ class FakeProvider:
         seen = self._calls.get(req.model, 0)
         self._calls[req.model] = seen + 1
 
-        if b.fail_always or seen < b.fail_first_n:
+        in_failing_round = req.round_no is not None and req.round_no in b.fail_rounds
+        if b.fail_always or seen < b.fail_first_n or in_failing_round:
             await asyncio.sleep(min(b.latency_ms, 50) / 1000)
             raise _fake_failure(self.name, req.model, b.fail_mode)
 
@@ -280,6 +292,10 @@ class FakeProvider:
 
         prompt_text = "\n".join(m.content for m in req.messages)
         text = self._compose(req, prompt_text)
+        if req.purpose == "issues":
+            text = _FAKE_ISSUES_JSON
+        elif req.purpose == "summary":
+            text = self._compose_summary(req, prompt_text)
         return ChatResponse(
             text=text,
             model=req.model,
@@ -299,6 +315,14 @@ class FakeProvider:
             f"{pick(_FAKE_BODIES, 1)} "
             f"{pick(_FAKE_BODIES, 2)} "
             f"{pick(_FAKE_CLOSERS, 3)}"
+        )
+
+    def _compose_summary(self, req: ChatRequest, prompt_text: str) -> str:
+        digest = hashlib.sha256(prompt_text.encode()).digest()
+        return (
+            f"양측은 측정 방법의 타당성을 두고 갈렸고, "
+            f"{_FAKE_BODIES[digest[0] % len(_FAKE_BODIES)]} "
+            f"쟁점 중 정의 합의 문제는 아직 해소되지 않았다."
         )
 
     async def list_models(self) -> list[str]:
@@ -401,7 +425,9 @@ class MeteredProvider:
     async def chat(self, req: ChatRequest) -> ChatResponse:
         resp = await self._inner.chat(req)
         self._meter.record(
-            purpose=self._purpose,
+            # 생성 시점이 아니라 요청에 실린 용도를 씁니다. 같은 인스턴스를
+            # 토론/쟁점/요약이 공유하므로 고정하면 전부 'debate' 가 됩니다.
+            purpose=req.purpose or self._purpose,
             agent_id=req.tag,
             provider=self.name,
             model=resp.model,
@@ -409,6 +435,7 @@ class MeteredProvider:
             latency_ms=resp.latency_ms,
             attempts=resp.attempts,
             finish_reason=resp.finish_reason,
+            round_no=req.round_no,
         )
         return resp
 

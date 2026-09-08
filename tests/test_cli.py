@@ -11,7 +11,7 @@ from debate.provider import FakeBehavior, FakeProvider
 
 
 def _run(monkeypatch, fake: FakeProvider, argv: list[str]) -> int:
-    monkeypatch.setattr(cli, "_build_fake", lambda specs, lat: fake)
+    monkeypatch.setattr(cli, "_build_fake", lambda *a, **k: fake)
     return cli.main(argv)
 
 
