@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 import httpx
@@ -253,3 +254,66 @@ async def test_response_without_usage_yields_zero_tokens():
     resp = await _provider(handler).chat(REQ)
     assert resp.usage == Usage(0, 0)
     assert resp.text == "답"
+
+
+# ── 응답 본문 정규화 (잘림 조사에서 나온 실제 결함) ──────────────────────────
+
+
+async def test_content_as_part_list_is_joined():
+    """content 가 파트 리스트로 오는 엔드포인트가 있습니다. 정규화하지 않으면
+    ChatResponse.text 에 str 이 아닌 값이 들어가 Agent 의 .strip() 에서 터집니다."""
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": [
+            {"type": "text", "text": "앞부분입니다. "},
+            {"type": "text", "text": "뒷부분입니다."}]}, "finish_reason": "stop"}], "usage": {}})
+
+    resp = await _provider(handler).chat(REQ)
+    assert isinstance(resp.text, str)
+    assert resp.text == "앞부분입니다. 뒷부분입니다."
+
+
+async def test_empty_content_is_a_failure_not_a_silent_blank_turn():
+    """빈 발언을 그대로 통과시키면 Judge 가 그걸 '논거 없음'으로 채점합니다."""
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": None}, "finish_reason": "stop"}], "usage": {}})
+
+    with pytest.raises(RetryableError, match="본문이 비어 있습니다"):
+        await _provider(handler).chat(REQ)
+
+
+async def test_empty_content_with_reasoning_field_says_so():
+    """thinking 계열이 본문을 별도 필드로 주는 경우를 구분해서 알려줍니다."""
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": "", "reasoning_content": "내부 사고"}, "finish_reason": "stop"}], "usage": {}})
+
+    with pytest.raises(RetryableError, match="reasoning 필드에는 내용이 있음"):
+        await _provider(handler).chat(REQ)
+
+
+async def test_length_finish_reason_is_preserved_not_swallowed():
+    """잘림은 조용히 지나가면 안 됩니다. 위로 그대로 전달돼야 표시할 수 있습니다."""
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": "으로 감소했습니다"}, "finish_reason": "length"}], "usage": {}})
+
+    resp = await _provider(handler).chat(REQ)
+    assert resp.finish_reason == "length"
+
+
+async def test_dump_hook_receives_raw_body_and_never_headers():
+    captured: list[dict] = []
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "답"}}], "usage": {}})
+
+    slot = ProviderSlot("t", "https://x.test/v1", SecretStr("sk-topsecret"))
+    p = OpenAICompatProvider(
+        slot, transport=httpx.MockTransport(handler),
+        dump=lambda req, body: captured.append(body),
+    )
+    await p.chat(REQ)
+
+    assert captured and captured[0]["choices"][0]["message"]["content"] == "답"
+    assert "sk-topsecret" not in json.dumps(captured)

@@ -19,7 +19,7 @@ import hashlib
 import random
 import time
 from dataclasses import dataclass, replace
-from typing import Iterable, Literal, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Callable, Literal, Mapping, Protocol, Sequence, runtime_checkable
 
 import httpx
 
@@ -77,8 +77,11 @@ class OpenAICompatProvider:
 
     def __init__(self, slot: ProviderSlot, *, timeout_s: float = 120.0,
                  max_connections: int = 10,
-                 transport: httpx.AsyncBaseTransport | None = None) -> None:
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 dump: Callable[[ChatRequest, dict], None] | None = None) -> None:
         self.name = slot.name
+        #: 원본 응답을 그대로 넘겨받는 훅. 잘림 원인 규명용(--dump-raw).
+        self._dump = dump
         self._base_url = slot.base_url
         headers = {"content-type": "application/json"}
         if slot.has_key:
@@ -117,9 +120,27 @@ class OpenAICompatProvider:
         try:
             body = resp.json()
             choice = body["choices"][0]
-            text = choice["message"]["content"] or ""
         except (ValueError, KeyError, IndexError, TypeError) as e:
             raise RetryableError(f"{self.name}: 응답 형식이 예상과 다름 ({e})") from e
+
+        if self._dump is not None:
+            self._dump(req, body)
+
+        message = choice.get("message") or {}
+        text = _extract_text(message)
+        finish_reason = choice.get("finish_reason")
+
+        if not text.strip():
+            # 조용히 빈 발언을 반환하면 토론에 빈 턴이 생기고 Judge 는 그걸
+            # "논거 없음"으로 채점합니다. 실패로 올려 재시도/dropout 을 태웁니다.
+            hint = ""
+            if message.get("reasoning_content") or message.get("reasoning"):
+                hint = " (reasoning 필드에는 내용이 있음 — 이 엔드포인트는 본문을 " \
+                       "별도 필드로 반환하는 것으로 보입니다)"
+            raise RetryableError(
+                f"{self.name}: 본문이 비어 있습니다 "
+                f"(finish_reason={finish_reason!r}){hint}"
+            )
 
         raw_usage = body.get("usage") or {}
         return ChatResponse(
@@ -130,7 +151,7 @@ class OpenAICompatProvider:
                 completion_tokens=int(raw_usage.get("completion_tokens", 0)),
             ),
             latency_ms=latency_ms,
-            finish_reason=choice.get("finish_reason"),
+            finish_reason=finish_reason,
         )
 
     def _raise_for_status(self, resp: httpx.Response) -> None:
@@ -161,6 +182,33 @@ class OpenAICompatProvider:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+
+def _extract_text(message: Mapping) -> str:
+    """message.content 를 문자열로 정규화합니다.
+
+    OpenAI 호환을 표방해도 content 의 모양이 갈립니다. 문자열인 곳도 있고,
+    `[{"type": "text", "text": ...}, ...]` 처럼 파트 리스트인 곳도 있습니다.
+    리스트를 그대로 두면 ChatResponse.text 에 str 이 아닌 값이 들어가고
+    Agent 의 .strip() 에서 터집니다 — 실험으로 확인한 실제 동작입니다.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, Mapping):
+                value = part.get("text") or part.get("content") or ""
+                if isinstance(value, str):
+                    parts.append(value)
+        return "".join(parts)
+    return str(content)
 
 
 # ── Fake ─────────────────────────────────────────────────────────────────────
@@ -405,6 +453,7 @@ def build_pool(
     settings: Settings,
     *,
     fake: FakeProvider | None = None,
+    dump: Callable[[ChatRequest, dict], None] | None = None,
 ) -> ProviderPool:
     """참가자들이 실제로 참조하는 프로바이더만 조립합니다.
 
@@ -436,6 +485,7 @@ def build_pool(
             registry.get(name),
             timeout_s=settings.request_timeout_s,
             max_connections=max(settings.max_concurrency, 1),
+            dump=dump,
         )
         built[name] = MeteredProvider(
             RetryingProvider(raw, attempts=settings.retry_attempts), meter

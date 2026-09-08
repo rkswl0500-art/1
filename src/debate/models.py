@@ -86,6 +86,13 @@ class Utterance:
     cost_usd: Decimal
     status: Literal["ok", "failed"] = "ok"
     error: str | None = None
+    #: 'length' 면 모델이 예산을 다 써 잘렸다는 뜻입니다. 토론에서는 치명적이라
+    #: 기록만 하지 말고 반드시 사용자에게 보여야 합니다.
+    finish_reason: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason == "length"
 
 
 @dataclass(frozen=True, slots=True)

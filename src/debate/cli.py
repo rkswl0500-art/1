@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
+import json
 import string
 import sys
 from decimal import Decimal
@@ -20,7 +22,10 @@ from .agent import Agent
 from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
 from .cost import CostMeter
 from .engine import DebateEngine
-from .models import AgentSpec, ConfigError, DebateConfig, DebateResult
+from .models import (
+    AgentDropped, AgentSpec, ConfigError, DebateConfig, DebateResult,
+    RoundStarted, UtteranceCompleted,
+)
 from .provider import FakeBehavior, FakeProvider, ProviderError, build_pool
 
 DEFAULT_PERSONA = "논리적 근거를 중시하는 토론자"
@@ -116,6 +121,76 @@ def _usd(x: Decimal) -> str:
     return f"${x.quantize(Decimal('0.0001'))}"
 
 
+_current_budget = "미상"
+
+
+class _Progress:
+    """라운드가 도는 동안 터미널에 진행 상황을 흘립니다.
+
+    느린 모델이 섞이면(관측: 54.3s vs 1.8s, 30배) 라운드 전체가 가장 느린
+    참가자에 묶입니다. 진행 표시가 없으면 그 시간이 통째로 무응답으로 보여서
+    멈춘 건지 기다리는 건지 알 수 없습니다. 슬라이스 4 의 SSE 가 쓸 이벤트
+    싱크를 그대로 사용하므로, 여기서 배선이 검증됩니다.
+    """
+
+    def __init__(self, labels: dict[str, str], concurrency: int) -> None:
+        self._labels = labels
+        self._concurrency = concurrency
+        self._done = 0
+        self._active = 0
+
+    async def __call__(self, event) -> None:
+        if isinstance(event, RoundStarted):
+            self._done, self._active = 0, len(event.active)
+            names = ", ".join(self._labels[a] for a in event.active)
+            print(f"\n[R{event.round_no}] 시작 — {names} (동시 {self._concurrency})",
+                  flush=True)
+        elif isinstance(event, UtteranceCompleted):
+            self._done += 1
+            u = event.utterance
+            print(f"  {event.label} 완료 ({_n(u.latency_ms)}ms, "
+                  f"{u.usage.completion_tokens}tok)  [{self._done}/{self._active}]",
+                  flush=True)
+        elif isinstance(event, AgentDropped):
+            print(f"  {self._labels.get(event.agent_id, event.agent_id)} 드롭 — "
+                  f"{event.reason}", flush=True)
+
+
+def _make_dump(dump_dir: str | None):
+    """원본 응답을 파일로 남깁니다. 잘림 원인 규명용.
+
+    요청 헤더는 저장하지 않습니다 — Authorization 이 그대로 파일에 남습니다.
+    저장하는 것은 보낸 메시지와 받은 JSON 본문뿐입니다.
+    """
+    if not dump_dir:
+        return None
+    out = Path(dump_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    counter = itertools.count(1)
+
+    def dump(req, body: dict) -> None:
+        path = out / f"{next(counter):02d}-{req.model.replace('/', '_')}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "request": {
+                        "model": req.model,
+                        "max_tokens": req.max_tokens,
+                        "temperature": req.temperature,
+                        "messages": [{"role": m.role, "content": m.content}
+                                     for m in req.messages],
+                    },
+                    "response": body,
+                },
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"[dump] {path}")
+
+    return dump
+
+
 def _print_result(result: DebateResult, meter: CostMeter) -> None:
     labels = {s.id: s.label for s in result.participants}
     models = {s.id: f"{s.provider}/{s.model}" for s in result.participants}
@@ -127,9 +202,12 @@ def _print_result(result: DebateResult, meter: CostMeter) -> None:
             if u.status == "failed":
                 print(f"{head}  ── 실패: {u.error}")
                 continue
-            print(f"{head}  ({_n(u.latency_ms)}ms, {models[u.agent_id]})")
+            flag = "  ⚠ 잘림(finish_reason=length)" if u.truncated else ""
+            print(f"{head}  ({_n(u.latency_ms)}ms, {models[u.agent_id]}, "
+                  f"{u.usage.completion_tokens}tok){flag}")
             for line in u.content.splitlines() or [""]:
                 print(f"  {line}")
+            print(f"  └ {len(u.content)}자 / finish_reason={u.finish_reason!r}")
             print()
 
         print(
@@ -174,6 +252,18 @@ def _print_diagnosis(result: DebateResult, rep) -> None:
             "\n힌트: FatalError 는 재시도로 해결되지 않는 설정 문제입니다.\n"
             "      401/403 → API_KEY, 404 → 모델 ID 오타 또는 BASE_URL 경로.\n"
             "      .env 의 DEBATE_PROVIDER_*_{API_KEY,BASE_URL} 과 모델 ID 를 확인하세요."
+        )
+
+    truncated = [
+        u for r in result.rounds for u in r.utterances
+        if u.status == "ok" and u.truncated
+    ]
+    if truncated:
+        who = ", ".join(sorted({u.agent_id for u in truncated}))
+        print(
+            f"\n경고: 발언이 잘렸습니다 (finish_reason=length): {who}\n"
+            f"      출력 토큰 예산이 부족합니다. DEBATE_MAX_OUTPUT_TOKENS 를 올리세요\n"
+            f"      (현재 {_current_budget}). 잘린 발언은 Judge 채점을 그대로 오염시킵니다."
         )
 
     if rep.calls and rep.total_tokens == 0:
@@ -235,17 +325,22 @@ async def _cmd_run(args: argparse.Namespace) -> int:
 
     pricing = PricingTable.load(settings.pricing_path)
     meter = CostMeter(pricing, debate_id="pending")
+    global _current_budget
+    _current_budget = settings.max_output_tokens
     pool = build_pool(
         specs,
         None if fake else load_provider_slots(),
         meter,
         settings,
         fake=_build_fake(specs, args.fake_latency) if fake else None,
+        dump=_make_dump(args.dump_raw),
     )
 
     concurrency = args.max_concurrency or settings.max_concurrency
     agents = [
-        Agent(s, pool.get(s.provider), pricing, timeout_s=settings.request_timeout_s)
+        Agent(s, pool.get(s.provider), pricing,
+              max_tokens=settings.max_output_tokens,
+              timeout_s=settings.request_timeout_s)
         for s in specs
     ]
     cfg = DebateConfig(
@@ -253,7 +348,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         participants=tuple(specs),
         rounds=rounds,
         max_concurrency=concurrency,
-        round_timeout_s=args.round_timeout or settings.request_timeout_s + 60,
+        round_timeout_s=args.round_timeout or settings.round_timeout_s,
     )
 
     print(f"주제: {topic}")
@@ -262,8 +357,13 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         f"프로바이더 {'fake' if fake else ', '.join(sorted({s.provider for s in specs}))}"
     )
 
+    warning = settings.timeout_warning()
+    if warning:
+        print(f"주의: {warning}")
+
+    progress = _Progress({s.id: s.label for s in specs}, concurrency)
     try:
-        result = await DebateEngine(agents).run(cfg)
+        result = await DebateEngine(agents, sink=progress).run(cfg)
     finally:
         await pool.aclose()
 
@@ -294,6 +394,10 @@ def main(argv: list[str] | None = None) -> int:
         help="fake 를 주면 실제 호출 없이 결정론적 가짜로 돌립니다",
     )
     r.add_argument("--fake-latency", help="fake 모드 참가자별 지연(ms), 콤마 구분")
+    r.add_argument(
+        "--dump-raw", metavar="DIR",
+        help="프로바이더 원본 JSON 응답을 이 디렉터리에 저장 (헤더/키는 저장 안 함)",
+    )
     r.set_defaults(fn=_cmd_run)
 
     args = parser.parse_args(argv)

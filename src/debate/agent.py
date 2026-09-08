@@ -49,7 +49,7 @@ class Agent:
         provider: ChatProvider,
         pricing: PricingTable,
         *,
-        max_tokens: int | None = 800,
+        max_tokens: int | None = 2048,
         timeout_s: float = 120.0,
     ) -> None:
         self.spec = spec
@@ -84,6 +84,7 @@ class Agent:
             usage=resp.usage,
             latency_ms=resp.latency_ms,
             cost_usd=cost,
+            finish_reason=resp.finish_reason,
         )
 
     @staticmethod

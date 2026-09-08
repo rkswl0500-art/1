@@ -57,11 +57,47 @@ class Settings(BaseSettings):
     )
 
     max_concurrency: int = 3
-    request_timeout_s: float = 120.0
+    request_timeout_s: float = 120.0   # 관측된 최대 지연 54s 의 2.2배
     retry_attempts: int = 3
     pricing_path: Path = Path("config/pricing.yaml")
     db_path: Path = Path("data/debates.db")
     ko_tokens_per_char: float = 1.0
+    #: 발언 1건의 출력 토큰 상한.
+    #:
+    #: 한국어는 600자만 해도 토크나이저에 따라 600~900 토큰입니다. 여기에
+    #: thinking 계열 모델은 사고 토큰까지 이 예산에서 쓰는 경우가 있어, 예산이
+    #: 빠듯하면 본문이 중간에 끊깁니다. 토론에서 잘린 발언은 곧 잘못된 판정이라
+    #: 넉넉하게 잡습니다.
+    max_output_tokens: int = 2048
+    #: 참가자 1명이 한 라운드에서 쓸 수 있는 총 시간(재시도 포함).
+    #:
+    #: 이 값이 retry_attempts × request_timeout_s 보다 작으면, 호출이 실제로
+    #: 타임아웃까지 매달릴 때 재시도 예산을 다 쓰기 전에 잘립니다. 둘 다 크게
+    #: 잡으면 느린 참가자 하나가 라운드를 몇 분씩 붙잡으므로 트레이드오프입니다.
+    #: 기본값은 retry_attempts × request_timeout_s (=360s) 를 덮도록 잡았습니다.
+    #: 이보다 낮추면 호출이 매달릴 때 재시도가 잘리고, 그 사실이 조용히 넘어가지
+    #: 않도록 timeout_warning() 이 알려줍니다.
+    #:
+    #: 이 값이 커도 정상 동작에는 영향이 없습니다 — 라운드는 실제 지연(관측 54s)
+    #: 만큼만 걸리고, 타임아웃은 실패할 때만 물립니다. 다만 진짜로 멈춘 참가자
+    #: 하나가 최대 이만큼 라운드를 붙잡을 수 있으므로, 그동안 누구를 기다리는지는
+    #: 진행 표시로 보입니다.
+    round_timeout_s: float = 400.0
+
+    @property
+    def retry_budget_s(self) -> float:
+        return self.retry_attempts * self.request_timeout_s
+
+    def timeout_warning(self) -> str | None:
+        """재시도 예산과 라운드 타임아웃이 어긋나면 그 사실을 문장으로."""
+        if self.round_timeout_s >= self.retry_budget_s:
+            return None
+        return (
+            f"라운드 타임아웃 {self.round_timeout_s:.0f}s < 재시도 예산 "
+            f"{self.retry_budget_s:.0f}s ({self.retry_attempts}회 × "
+            f"{self.request_timeout_s:.0f}s). 호출이 타임아웃까지 매달리면 "
+            f"재시도를 다 쓰기 전에 라운드 타임아웃이 먼저 참가자를 드롭합니다."
+        )
 
 
 #: 기본 .env 경로. env_file=None 을 명시하면 파일을 아예 안 읽습니다.

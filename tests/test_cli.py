@@ -70,3 +70,59 @@ def test_healthy_run_prints_no_hints(monkeypatch, capsys):
     assert code == 0
     assert "힌트:" not in out
     assert "failed=0" in out
+
+
+def test_truncated_utterance_is_flagged_loudly(monkeypatch, capsys):
+    """토론에서 잘린 발언은 곧 잘못된 판정입니다. 기록만 하고 안 보여주면
+    사용자는 Judge 결과가 왜 이상한지 영원히 모릅니다."""
+    class Truncating(FakeProvider):
+        async def chat(self, req):
+            from dataclasses import replace
+            return replace(await super().chat(req), finish_reason="length")
+
+    code = _run(monkeypatch, Truncating({"m1": FakeBehavior(latency_ms=1),
+                                         "m2": FakeBehavior(latency_ms=1)}), BASE)
+    out = capsys.readouterr().out
+
+    assert code == 0                                  # 실패가 아니라서 더 위험
+    assert "⚠ 잘림(finish_reason=length)" in out
+    assert "발언이 잘렸습니다" in out
+    assert "DEBATE_MAX_OUTPUT_TOKENS" in out
+
+
+def test_normal_finish_reason_prints_no_truncation_warning(monkeypatch, capsys):
+    fake = FakeProvider({"m1": FakeBehavior(latency_ms=1), "m2": FakeBehavior(latency_ms=1)})
+    _run(monkeypatch, fake, BASE)
+    out = capsys.readouterr().out
+
+    assert "잘림" not in out
+    assert "finish_reason='stop'" in out              # 항상 보이게
+
+
+def test_progress_shows_fast_agent_while_slow_one_runs(monkeypatch, capsys):
+    """지연 편차가 30배(관측: 54.3s vs 1.8s)라 라운드는 가장 느린 참가자에
+    묶입니다. 빠른 쪽 완료가 즉시 보여야 멈춘 게 아니라 기다리는 중임을 압니다."""
+    fake = FakeProvider({"m1": FakeBehavior(latency_ms=200),
+                         "m2": FakeBehavior(latency_ms=5)})
+    _run(monkeypatch, fake, BASE)
+    out = capsys.readouterr().out
+
+    assert "[R1] 시작" in out
+    assert "참가자 B 완료" in out and "[1/2]" in out    # 빠른 쪽이 먼저
+    assert out.index("참가자 B 완료") < out.index("참가자 A 완료")
+
+
+def test_timeout_warning_silent_on_defaults(monkeypatch, capsys):
+    """기본값에서 뜨는 경고는 경고가 아니라 노이즈입니다."""
+    fake = FakeProvider({"m1": FakeBehavior(latency_ms=1), "m2": FakeBehavior(latency_ms=1)})
+    _run(monkeypatch, fake, BASE)
+    assert "라운드 타임아웃" not in capsys.readouterr().out
+
+
+def test_timeout_warning_fires_on_inconsistent_override(monkeypatch, capsys):
+    monkeypatch.setenv("DEBATE_ROUND_TIMEOUT_S", "60")
+    fake = FakeProvider({"m1": FakeBehavior(latency_ms=1), "m2": FakeBehavior(latency_ms=1)})
+    _run(monkeypatch, fake, BASE)
+    out = capsys.readouterr().out
+
+    assert "라운드 타임아웃 60s < 재시도 예산 360s" in out

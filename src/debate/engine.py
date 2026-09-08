@@ -100,7 +100,12 @@ class DebateEngine:
         async def one(agent: Agent) -> Utterance:
             ctx = self._context_for(agent, round_no, cfg)
             async with sem:
-                return await asyncio.wait_for(agent.speak(ctx), cfg.round_timeout_s)
+                utterance = await asyncio.wait_for(agent.speak(ctx), cfg.round_timeout_s)
+            # gather 가 끝난 뒤가 아니라 **완료 즉시** 방출합니다. 뒤로 미루면
+            # 이벤트가 참가자 순서대로 한꺼번에 나가고, 지연 편차가 큰 라운드에서
+            # 진행 표시가 전혀 진행 표시 구실을 못 합니다.
+            await self._sink(UtteranceCompleted(utterance, agent.label))
+            return utterance
 
         started = time.perf_counter()
         # return_exceptions=True 가 요구사항 7 의 핵심입니다. 한 명이 터져도
@@ -115,8 +120,7 @@ class DebateEngine:
                 failures.append((agent, outcome))
                 utterances.append(Agent.failed(agent.spec, round_no, outcome))
             else:
-                utterances.append(outcome)
-                await self._sink(UtteranceCompleted(outcome, agent.label))
+                utterances.append(outcome)  # 이벤트는 one() 에서 이미 방출됨
 
         result = RoundResult(
             round_no=round_no,
