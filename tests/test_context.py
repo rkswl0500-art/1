@@ -172,7 +172,7 @@ async def test_directives_are_cleared_after_their_round():
 
     engine = DebateEngine(agents, ContextBuilder(anon),
                           Moderator(shared, specs[0].model), anon, gate=gate)
-    await engine.run(DebateConfig(topic="주제", participants=tuple(specs), rounds=3))
+    await engine.run(DebateConfig(debate_id="d_t", topic="주제", participants=tuple(specs), rounds=3))
 
     assert gate.calls == [1, 2, 3]      # 매 라운드 게이트를 거침
 

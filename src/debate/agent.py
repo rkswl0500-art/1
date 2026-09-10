@@ -21,6 +21,8 @@ from .provider import ChatProvider, ProviderError
 
 #: 모든 참가자에게 공통으로 붙는 규칙. 마지막 항목이 익명화의 1차 방어선입니다
 #: (2차는 슬라이스 2 의 Anonymizer.scrub). 문체 기반 추정까지는 못 막습니다.
+DEFAULT_PERSONA_FALLBACK = "논리적 근거를 중시하는 토론자"
+
 DEBATE_RULES = """[규칙]
 - 한국어로 답하십시오.
 - 근거를 먼저 제시하고 주장을 뒤에 두십시오.

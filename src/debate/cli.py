@@ -24,10 +24,12 @@ from .cost import CostMeter, Estimator
 from .context import ContextBuilder
 from .engine import DebateEngine
 from .judge import Judge, family_note
+from .session import new_debate_id
 from .storage import SqliteStore
 from .models import (
     AgentDropped, AgentSpec, ConfigError, DebateConfig, DebateResult,
     IssuesExtracted, RoundStarted, RoundSummarized, UtteranceCompleted,
+    UtteranceStarted,
 )
 from .provider import FakeBehavior, FakeProvider, ProviderError, build_pool
 
@@ -182,6 +184,8 @@ class _Progress:
             print(f"  {event.label} 완료 ({_n(u.latency_ms)}ms, "
                   f"{u.usage.completion_tokens}tok)  [{self._done}/{self._active}]",
                   flush=True)
+        elif isinstance(event, UtteranceStarted):
+            print(f"  {event.label} 말하는 중…", flush=True)
         elif isinstance(event, IssuesExtracted):
             print(f"\n쟁점 ({len(event.issues)}):", flush=True)
             for n, issue in enumerate(event.issues, start=1):
@@ -467,7 +471,8 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     judge_spec = _resolve_judge(args, specs, settings)
 
     pricing = PricingTable.load(settings.pricing_path)
-    meter = CostMeter(pricing, debate_id="pending")
+    debate_id = new_debate_id()
+    meter = CostMeter(pricing, debate_id)
     global _current_budget
     _current_budget = settings.max_output_tokens
     pool = build_pool(
@@ -488,6 +493,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         for s in specs
     ]
     cfg = DebateConfig(
+        debate_id=debate_id,
         topic=topic,
         participants=tuple(specs),
         rounds=rounds,

@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-import uuid
 from typing import Awaitable, Callable, Protocol, Sequence
 
 from .agent import Agent, Anonymizer, Moderator
@@ -34,6 +33,7 @@ from .models import (
     RoundStarted,
     RoundSummarized,
     Utterance,
+    UtteranceStarted,
     UtteranceCompleted,
 )
 
@@ -83,7 +83,7 @@ class DebateEngine:
         self._sink = sink or _noop_sink
 
     async def run(self, cfg: DebateConfig) -> DebateResult:
-        debate_id = f"d_{uuid.uuid4().hex[:6]}"
+        debate_id = cfg.debate_id
         specs = tuple(a.spec for a in self._agents)
         state = DebateState(topic=cfg.topic)
         warnings: list[str] = []
@@ -191,6 +191,9 @@ class DebateEngine:
             # 대기 중에 바뀌지 않습니다.
             ctx = self._builder.build_for(agent.spec, state)
             async with sem:
+                # 세마포어를 얻은 뒤에 방출합니다. 그래야 "말하는 중"과
+                # "차례를 기다리는 중"이 화면에서 갈립니다.
+                await self._sink(UtteranceStarted(agent.id, agent.label, round_no))
                 utterance = await asyncio.wait_for(agent.speak(ctx), cfg.round_timeout_s)
             # gather 가 끝난 뒤가 아니라 **완료 즉시** 방출합니다. 뒤로 미루면
             # 이벤트가 참가자 순서대로 한꺼번에 나가고, 지연 편차가 큰 라운드에서

@@ -186,3 +186,53 @@ def test_unpriced_models_do_not_break_the_estimate():
 def test_estimate_reports_the_coefficient_it_used():
     text = _estimator().estimate(participants=_specs(2), rounds=1, judge_model=None).format()
     assert "한국어 토큰 계수 1.0" in text
+
+
+# ── 원장과 토론이 같은 id 를 쓰는가 ─────────────────────────────────────────
+
+
+def test_ledger_rows_join_back_to_their_debate(store):
+    """slice 3 검증이 놓친 것.
+
+    당시 `select purpose, count(*) ... group by purpose` 로만 확인해서 원장이
+    **어느 토론 것인지**는 보지 않았습니다. 엔진이 debate_id 를 따로 만들고
+    있어서 debates 행과 llm_calls 행의 id 가 서로 달랐고, 조인하는 순간
+    한 건도 안 나오는 상태였습니다. group by 는 그걸 못 잡습니다.
+    """
+    store.save(_result(), _meter(), _verdict(), None)
+    c = sqlite3.connect(store.path)
+
+    orphans = c.execute(
+        "select count(*) from llm_calls l"
+        " where not exists (select 1 from debates d where d.debate_id = l.debate_id)"
+    ).fetchone()[0]
+    assert orphans == 0
+
+    joined = c.execute(
+        "select count(*) from llm_calls l join debates d using (debate_id)"
+    ).fetchone()[0]
+    assert joined == 2                      # 원장 2건이 토론에 붙어 있어야 함
+
+
+async def test_engine_uses_the_debate_id_it_was_given():
+    """엔진이 id 를 새로 만들면 원장·저장·API 가 서로 다른 값을 갖게 됩니다."""
+    from debate.agent import Agent, Anonymizer, Moderator
+    from debate.context import ContextBuilder
+    from debate.engine import DebateEngine
+    from debate.models import DebateConfig
+    from debate.provider import FakeBehavior, FakeProvider, MeteredProvider
+
+    specs = [AgentSpec(f"p{i}", f"참가자 {c}", "fake", f"m{i}", "토론자")
+             for i, c in ((1, "A"), (2, "B"))]
+    meter = CostMeter(PricingTable({}), "d_fixed")
+    prov = MeteredProvider(
+        FakeProvider({s.model: FakeBehavior(latency_ms=1) for s in specs}), meter)
+    anon = Anonymizer(specs)
+    engine = DebateEngine([Agent(s, prov, PricingTable({})) for s in specs],
+                          ContextBuilder(anon), Moderator(prov, "m1"), anon)
+
+    result = await engine.run(DebateConfig(debate_id="d_fixed", topic="주제",
+                                           participants=tuple(specs), rounds=1))
+
+    assert result.debate_id == "d_fixed"
+    assert {r.debate_id for r in meter.records} == {"d_fixed"}

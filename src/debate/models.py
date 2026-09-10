@@ -193,6 +193,10 @@ class ContextPack:
 @dataclass(frozen=True, slots=True)
 class DebateConfig:
     topic: str
+    #: 토론 식별자. **한 번만 만들어 원장·저장·API 가 같은 값을 씁니다.**
+    #: 엔진이 따로 만들면 debates 행과 llm_calls 행이 서로 다른 id 를 갖게 되어
+    #: 원장이 토론에서 떨어져 나갑니다.
+    debate_id: str
     participants: tuple[AgentSpec, ...]
     rounds: int = 3
     max_concurrency: int = 3
@@ -295,6 +299,20 @@ class RoundStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class UtteranceStarted:
+    """세마포어를 얻어 실제로 호출이 나간 시점.
+
+    RoundStarted 의 active 목록과 구분됩니다 — 동시성 3 에 참가자 5명이면
+    라운드가 시작돼도 2명은 아직 대기 중입니다. UI 가 "말하는 중"과
+    "차례 기다리는 중"을 구분하려면 이 이벤트가 필요합니다.
+    """
+
+    agent_id: str
+    label: str
+    round_no: int
+
+
+@dataclass(frozen=True, slots=True)
 class UtteranceCompleted:
     utterance: Utterance
     label: str
@@ -331,6 +349,7 @@ class DebateCompleted:
 DebateEvent = Union[
     DebateStarted,
     RoundStarted,
+    UtteranceStarted,
     UtteranceCompleted,
     AgentDropped,
     IssuesExtracted,

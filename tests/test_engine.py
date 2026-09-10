@@ -52,7 +52,7 @@ def _engine(agents, specs, *, sink=None, gate=None, moderator=None):
 
 
 def _cfg(specs, **kw) -> DebateConfig:
-    return DebateConfig(topic="원격근무는 생산성을 높이는가",
+    return DebateConfig(debate_id="d_t", topic="원격근무는 생산성을 높이는가",
                         participants=tuple(specs), rounds=1, **kw)
 
 
@@ -254,7 +254,7 @@ async def test_dropped_agent_is_excluded_from_every_later_round():
         "ok2": FakeBehavior(latency_ms=1),
     })
     result = await _engine(agents, specs).run(
-        DebateConfig(topic="주제", participants=tuple(specs), rounds=4)
+        DebateConfig(debate_id="d_t", topic="주제", participants=tuple(specs), rounds=4)
     )
 
     assert result.dropped == ("p2",)
@@ -274,7 +274,7 @@ async def test_ledger_separates_debate_issues_and_summary_calls():
     agents, specs, meter = _agents({"a": FakeBehavior(latency_ms=1),
                                     "b": FakeBehavior(latency_ms=1)})
     await _engine(agents, specs).run(
-        DebateConfig(topic="주제", participants=tuple(specs), rounds=3)
+        DebateConfig(debate_id="d_t", topic="주제", participants=tuple(specs), rounds=3)
     )
 
     purposes = [r.purpose for r in meter.records]
@@ -296,7 +296,7 @@ async def test_moderator_failure_warns_but_does_not_kill_the_debate():
 
     agents, specs, _ = _agents({"a": FakeBehavior(latency_ms=1), "b": FakeBehavior(latency_ms=1)})
     result = await _engine(agents, specs, moderator=BrokenModerator()).run(
-        DebateConfig(topic="주제", participants=tuple(specs), rounds=3)
+        DebateConfig(debate_id="d_t", topic="주제", participants=tuple(specs), rounds=3)
     )
 
     assert result.status == "completed"
@@ -318,7 +318,7 @@ async def test_digest_folds_one_round_behind_the_verbatim_one():
 
     spy = SpyModerator(agents[0]._provider, specs[0].model)
     await _engine(agents, specs, moderator=spy).run(
-        DebateConfig(topic="주제", participants=tuple(specs), rounds=4)
+        DebateConfig(debate_id="d_t", topic="주제", participants=tuple(specs), rounds=4)
     )
 
     # R2 를 마치면 R1 을, R3 를 마치면 R2 를 접습니다. R4 는 마지막이라 접지 않음.
