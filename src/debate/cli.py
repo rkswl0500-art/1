@@ -20,9 +20,11 @@ import yaml
 
 from .agent import Agent, Anonymizer, Moderator
 from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
-from .cost import CostMeter
+from .cost import CostMeter, Estimator
 from .context import ContextBuilder
 from .engine import DebateEngine
+from .judge import Judge, family_note
+from .storage import SqliteStore
 from .models import (
     AgentDropped, AgentSpec, ConfigError, DebateConfig, DebateResult,
     IssuesExtracted, RoundStarted, RoundSummarized, UtteranceCompleted,
@@ -251,6 +253,56 @@ def _preview_context(builder, specs, cfg) -> None:
     print("=" * 70)
 
 
+def _resolve_judge(args, specs: list[AgentSpec], settings) -> tuple[str, str] | None:
+    """(provider, model). Judge 를 참가자 풀에서 배제합니다.
+
+    검증은 **모델 ID 비교**입니다. 같은 벤더 계열(예: gemini-flash 참가자 +
+    gemini-pro judge)은 이 검사를 통과하면서도 자기편애가 남습니다 — 계열 기준이
+    애매해서 막지 않기로 한 결정이고, 대신 실행 끝에 계열을 사실로 찍습니다.
+    """
+    if not args.judge:
+        return None
+    provider, _, model = args.judge.rpartition("/")
+    if not provider:
+        provider = specs[0].provider
+    if not model:
+        raise ConfigError(f"--judge {args.judge!r}: 'provider/model' 형식으로 쓰세요")
+
+    overlap = sorted({s.model for s in specs if s.model == model})
+    if overlap and not args.allow_judge_overlap:
+        raise ConfigError(
+            f"judge 모델 {model!r} 이 참가자 풀에 있습니다. "
+            "LLM 은 자기 출력을 편애해서 점수가 오염됩니다. 다른 모델을 쓰거나, "
+            "모델이 부족하면 --allow-judge-overlap 으로 명시적으로 허용하세요."
+        )
+    return provider, model
+
+
+def _print_verdict(verdict) -> None:
+    print(f"\n{'─' * 60}\n판정 (judge: {verdict.judge_model})")
+    if verdict.status == "unparsed":
+        print("  ⚠ 판정을 파싱하지 못했습니다. 원문만 저장했습니다.")
+        print(f"  원문 앞부분: {verdict.raw[:200]!r}")
+        return
+
+    for score in verdict.per_issue:
+        pairs = "  ".join(f"{k} {v}" for k, v in sorted(score.scores.items()))
+        print(f"  [{score.issue_id}] {pairs}")
+        if score.reasoning:
+            print(f"        {score.reasoning}")
+    totals = verdict.totals()
+    print("  루브릭 합계: " + "  ".join(f"{k} {v}" for k, v in sorted(totals.items())))
+    winner = verdict.winner or "무승부"
+    print(f"  승자: {winner} ({verdict.margin})")
+    if verdict.conclusion:
+        print(f"  결론: {verdict.conclusion}")
+    if verdict.dissent:
+        print(f"  미해결 반론: {verdict.dissent}")
+    if verdict.truncated:
+        print("  ⚠ 판정이 잘렸습니다(finish_reason=length). "
+              "단일 패스 한계에 도달했을 수 있습니다.")
+
+
 def _print_result(result: DebateResult, meter: CostMeter) -> None:
     labels = {s.id: s.label for s in result.participants}
     models = {s.id: f"{s.provider}/{s.model}" for s in result.participants}
@@ -368,10 +420,28 @@ async def _cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _cmd_run(args: argparse.Namespace) -> int:
+async def _cmd_estimate(args: argparse.Namespace) -> int:
+    """LLM 을 한 번도 부르지 않고 비용 범위를 냅니다."""
     settings = Settings()
     fake = args.provider_override == FAKE_PROVIDER
+    topic, rounds, specs = _collect_specs(args, fake)
+    pricing = PricingTable.load(settings.pricing_path)
 
+    judge = _resolve_judge(args, specs, settings)
+    estimate = Estimator(pricing, settings.ko_tokens_per_char).estimate(
+        participants=specs, rounds=rounds,
+        judge_model=judge[1] if judge else None,
+        moderator_model=args.moderator,
+    )
+    print(f"주제: {topic}")
+    print(f"참가자 {len(specs)}명 | 라운드 {rounds}"
+          + (f" | judge {judge[1]}" if judge else " | judge 없음"))
+    print(estimate.format())
+    print("llm_calls_made = 0")
+    return 0
+
+
+def _collect_specs(args, fake: bool) -> tuple[str, int, list[AgentSpec]]:
     if args.config:
         topic, rounds, specs = _load_roster(Path(args.config), fake=fake)
         topic = args.topic or topic
@@ -382,11 +452,19 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         specs = [_parse_agent_flag(a, i, fake=fake) for i, a in enumerate(args.agent)]
         topic = args.topic or ""
         rounds = args.rounds if args.rounds is not None else 1
-
     if not topic:
         raise ConfigError("--topic 이 필요합니다")
     if not 2 <= len(specs) <= 5:
         raise ConfigError(f"참가자는 2~5명이어야 합니다 (현재 {len(specs)}명)")
+    return topic, rounds, specs
+
+
+async def _cmd_run(args: argparse.Namespace) -> int:
+    settings = Settings()
+    fake = args.provider_override == FAKE_PROVIDER
+
+    topic, rounds, specs = _collect_specs(args, fake)
+    judge_spec = _resolve_judge(args, specs, settings)
 
     pricing = PricingTable.load(settings.pricing_path)
     meter = CostMeter(pricing, debate_id="pending")
@@ -422,6 +500,12 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         f"참가자 {len(specs)}명 | 라운드 {rounds} | 동시성 {concurrency} | "
         f"프로바이더 {'fake' if fake else ', '.join(sorted({s.provider for s in specs}))}"
     )
+    estimate = Estimator(pricing, settings.ko_tokens_per_char).estimate(
+        participants=specs, rounds=rounds,
+        judge_model=judge_spec[1] if judge_spec else None,
+        moderator_model=args.moderator,
+    )
+    print(estimate.format())
 
     warning = settings.timeout_warning()
     if warning:
@@ -444,7 +528,43 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     finally:
         await pool.aclose()
 
+    verdict = None
+    if judge_spec and result.rounds:
+        anon_transcript = tuple(
+            anonymizer.to_anon(u)
+            for r in result.rounds for u in r.utterances if u.status == "ok"
+        )
+        judge = Judge(pool.get(judge_spec[0]), judge_spec[1],
+                      timeout_s=settings.request_timeout_s)
+        verdict = await judge.evaluate(
+            topic, result.issues, anon_transcript,
+            labels=[s.label for s in specs],
+        )
+
     _print_result(result, meter)
+    if verdict is not None:
+        _print_verdict(verdict)
+
+    note = None
+    if judge_spec:
+        note = family_note(judge_spec[1], [s.model for s in specs])
+        # 경고가 아니라 사실 진술입니다. 모델 ID 비교만으로는 계열 내
+        # 자기편애를 막지 못하므로, 막는 대신 관측 가능하게 둡니다.
+        print(f"\n{note.line()}")
+
+    rep = meter.report()
+    print(f"견적 대비 실제: 예상 {_usd(estimate.low_usd)}~{_usd(estimate.high_usd)} "
+          f"({estimate.tokens_low:,}~{estimate.tokens_high:,} tok) → "
+          f"실제 {_usd(rep.total_usd)} ({rep.total_tokens:,} tok, {rep.calls}회)")
+
+    if not args.no_store:
+        store = SqliteStore(settings.db_path)
+        try:
+            store.save(result, meter, verdict, note)
+            print(f"저장: {settings.db_path} (debate_id={result.debate_id})")
+        finally:
+            store.close()
+
     return 0 if result.status == "completed" else 1
 
 
@@ -471,6 +591,10 @@ def main(argv: list[str] | None = None) -> int:
         help="fake 를 주면 실제 호출 없이 결정론적 가짜로 돌립니다",
     )
     r.add_argument("--fake-latency", help="fake 모드 참가자별 지연(ms), 콤마 구분")
+    r.add_argument("--judge", help="심판 모델 'provider/model'. 참가자와 같은 모델은 거부")
+    r.add_argument("--allow-judge-overlap", action="store_true",
+                   help="judge 가 참가자와 같은 모델이어도 허용 (점수 오염 감수)")
+    r.add_argument("--no-store", action="store_true", help="sqlite 저장 생략")
     r.add_argument("--show-context", action="store_true",
                    help="마지막 라운드 컨텍스트를 실행 전에 출력")
     r.add_argument("--moderator", help="쟁점 추출·요약에 쓸 모델 (기본: 첫 참가자)")
@@ -481,6 +605,15 @@ def main(argv: list[str] | None = None) -> int:
         help="프로바이더 원본 JSON 응답을 이 디렉터리에 저장 (헤더/키는 저장 안 함)",
     )
     r.set_defaults(fn=_cmd_run)
+
+    e = sub.add_parser("estimate", help="LLM 호출 없이 비용 범위 계산")
+    for flag in ("--topic", "--config", "--moderator", "--judge"):
+        e.add_argument(flag)
+    e.add_argument("--agent", action="append")
+    e.add_argument("--rounds", type=int)
+    e.add_argument("--allow-judge-overlap", action="store_true")
+    e.add_argument("--provider-override", choices=[FAKE_PROVIDER])
+    e.set_defaults(fn=_cmd_estimate)
 
     args = parser.parse_args(argv)
     try:

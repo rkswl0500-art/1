@@ -3,7 +3,7 @@
 여러 AI가 하나의 주제로 다라운드 토론하고, 별도 Judge AI가 전체를 평가해 결론을 내리는
 멀티 에이전트 시스템.
 
-> **현재 상태: 슬라이스 2 완료.** 라이브 스모크는 슬라이스 1 시점에 통과했습니다.
+> **현재 상태: 슬라이스 3 완료.** 라이브 스모크는 슬라이스 1 시점에 통과했습니다.
 > 골격과 검증만 있습니다. Judge · 다라운드 · 쟁점 추출 · 저장 · API · UI 는 아직 없습니다.
 > 실제 모델 호출 경로(`OpenAICompatProvider`)는 구현·테스트돼 있지만 **진짜 프로바이더로는
 > 아직 한 번도 안 돌려봤습니다.** 아래 [라이브 스모크 3단계](#라이브-스모크-3단계)를
@@ -278,6 +278,55 @@ python -m debate.cli run --topic "..." --agent gemini/<ID> --agent gemini/<ID> -
   원장에 남는 실사용량은 언제나 API 응답의 `usage` 라서 계수가 틀려도 기록은 정확합니다.
   슬라이스 3 에서 estimate vs actual 로 보정합니다.
 
+## 판정과 비용
+
+```
+python -m debate.cli estimate --config config/participants.yaml --judge gemini/<ID>
+python -m debate.cli run --config config/participants.yaml --judge gemini/<ID>
+```
+
+`estimate` 는 **LLM 을 한 번도 부르지 않습니다** (`llm_calls_made = 0`). 비용을
+보고 시작 여부를 정하라고 생성과 실행이 나뉘어 있습니다. 견적은 **범위**로
+나옵니다 — 출력 길이를 모르는데 단일 숫자를 내면 그건 거짓말입니다.
+
+Judge 는 **참가자와 같은 모델이면 실행 전에 거부합니다**(`ConfigError`, 과금 0).
+모델이 부족하면 `--allow-judge-overlap` 으로 명시적으로 허용할 수 있습니다.
+
+편향 대응 두 가지가 들어가 있습니다:
+
+- **자기편애** — Judge 모델을 참가자 풀에서 배제. 발언은 익명 라벨로만 전달.
+- **위치 편향** — LLM 심판은 먼저/나중에 제시된 쪽을 우대하므로, 라운드마다
+  제시 순서를 섞습니다.
+
+Judge 는 참가자 수와 무관하게 **단일 패스**입니다. 대신 `prompt_tokens` 와
+`finish_reason` 을 기록해서 실제로 잘리는 시점을 관측만 합니다 — 5명에서 잘리는
+게 확인되면 그때 map-reduce 로 가릅니다.
+
+## 저장된 기록 보기
+
+`data/debates.db` (sqlite). `sqlite3` CLI 가 없으면 파이썬으로 보면 됩니다:
+
+```python
+import sqlite3
+c = sqlite3.connect("data/debates.db"); c.row_factory = sqlite3.Row
+
+# 익명화 검증 — Judge 에게 실제로 보낸 프롬프트를 그대로 검사
+prompt = c.execute("select judge_prompt from verdicts").fetchone()[0]
+models = [r[0] for r in c.execute("select distinct model from participants")]
+print([m for m in models if m in prompt])      # [] 여야 정상
+
+# 라벨 -> 모델 매핑 (DB 에만 있고 프롬프트에는 없음)
+print(dict(c.execute("select anon_label, model from participants")))
+
+# 용도별 · 라운드별 비용
+for r in c.execute("select purpose, count(*), sum(in_tok), sum(out_tok)"
+                   " from llm_calls group by purpose"):
+    print(tuple(r))
+```
+
+재개(resume)는 지원하지 않습니다. 사후 기록만 필요하다는 결정에 따라 체크포인트
+없이 완료 시점에 한 번 씁니다.
+
 ## 사람의 개입 (슬라이스 4 예정, 자리만 뚫려 있음)
 
 토론 중간에 사람이 지시를 넣는 기능은 아직 **동작하지 않습니다.** 다만 나중에
@@ -324,14 +373,14 @@ python -m pytest tests/ -q
 | # | 범위 | 파일 |
 |---|---|---|
 | ~~2~~ | ~~다라운드 · 쟁점 추출 · 컨텍스트 압축 · 익명화 스크럽~~ (완료) | `context.py`, `agent.py` |
-| 3 | Judge(단일 패스) · 사전 견적 · sqlite 저장 | `judge.py`, `cost.py`(Estimator), `storage.py` |
+| ~~3~~ | ~~Judge(단일 패스) · 사전 견적 · sqlite 저장~~ (완료) | `judge.py`, `cost.py`, `storage.py` |
 | 4 | FastAPI · SSE · 단일 HTML UI | `api.py`, `static/index.html` |
 
 v1 범위에서 **뺀 것**: 조기 종료(합의 시 라운드 중단), Judge 의 참가자 수별 분기,
 토론 재개. Judge 는 단일 패스로 고정하되 `prompt_tokens` 와 `finish_reason` 을
 기록해서 실제로 잘리는 시점을 관측할 수 있게만 해둡니다.
 
-### 슬라이스 3 시작 전 결론 낼 것 — Judge 격리의 구멍
+### 알려진 한계 — Judge 격리는 계열 내 자기편애를 막지 못합니다
 
 `allow_judge_model_overlap=False` 검사는 **모델 ID 만 비교**합니다. 그래서
 
@@ -350,4 +399,20 @@ v1 범위에서 **뺀 것**: 조기 종료(합의 시 라운드 중단), Judge �
 2. 문서에 한계로만 명시하고 검사는 ID 단위로 유지 — 구현은 안 늘지만 사용자가
    구멍을 모르고 지나갈 수 있습니다.
 
-**아직 구현하지 않았습니다.** 슬라이스 3 진입 시 판단해서 제안할 항목입니다.
+**막지 않기로 했습니다.** 이유 둘:
+
+1. 프로바이더 키가 하나뿐이면 계열 경고가 **매 실행마다** 뜹니다. 기본 설정에서
+   뜨는 경고는 노이즈이고, 노이즈가 되면 진짜 경고도 같이 무시됩니다.
+2. 계열 판정 기준 자체가 애매합니다. 접두사로 자를지 벤더로 자를지, OpenRouter
+   경유는 어떻게 볼지. 오탐이 나면 정상 설정이 막힙니다.
+
+**대신 관측 가능하게 두었습니다.** 실행 끝에 사실 한 줄이 찍히고(경고 아님),
+`debates` 테이블에 `judge_family` · `participant_families` ·
+`judge_shares_family` 가 기록됩니다:
+
+```
+judge: gemini 계열 (참가자와 동일; 참가자 계열: gemini)
+```
+
+**두 번째 프로바이더 키를 붙이면 해소됩니다.** 그때 같은 계열일 때와 다를 때의
+점수 분포를 실측으로 비교할 수 있습니다 — 추측으로 막는 것보다 낫습니다.

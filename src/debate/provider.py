@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import re
 import random
 import time
 from dataclasses import dataclass, replace
@@ -250,6 +252,33 @@ _FAKE_ISSUES_JSON = """{"issues": [
   "신입 온보딩과 암묵지 전수에 미치는 영향"
 ]}"""
 
+def _fake_verdict(prompt_text: str) -> str:
+    """fake 판정. 프롬프트에 등장하는 라벨을 그대로 채점 대상으로 씁니다 —
+    라벨을 지어내면 Judge 파서의 라벨 검증이 의미를 잃습니다."""
+    labels = sorted(set(re.findall(r"참가자 [A-Z]", prompt_text)))
+    if not labels:
+        labels = ["참가자 A", "참가자 B"]
+    digest = hashlib.sha256(prompt_text.encode()).digest()
+    score = lambda i, k: 4 + (digest[(i * 4 + k) % len(digest)] % 7)  # noqa: E731
+    issues = sorted(set(re.findall(r"\b(i\d+)\)", prompt_text))) or ["i1"]
+    totals = {L: sum(score(i, k) for k in range(4)) for i, L in enumerate(labels)}
+    best = max(totals, key=lambda L: totals[L])
+    return json.dumps({
+        "per_issue": [
+            {"issue_id": iid,
+             "scores": {L: score(i, n) for i, L in enumerate(labels)},
+             "reasoning": "측정 방법의 타당성에서 갈렸다."}
+            for n, iid in enumerate(issues)
+        ],
+        "rubric": {L: {k: score(i, n) for n, k in enumerate(("근거", "논리", "반박", "명료성"))}
+                   for i, L in enumerate(labels)},
+        "winner": best,
+        "margin": "narrow",
+        "conclusion": f"{best} 가 근거의 구체성에서 앞섰다.",
+        "dissent": f"{best} 는 온보딩 비용 논점에 끝까지 답하지 않았다.",
+    }, ensure_ascii=False)
+
+
 _FAKE_CLOSERS = (
     "따라서 저는 조건부로만 이 주장에 동의합니다.",
     "그러므로 입증 책임은 여전히 반대편에 있습니다.",
@@ -296,6 +325,8 @@ class FakeProvider:
             text = _FAKE_ISSUES_JSON
         elif req.purpose == "summary":
             text = self._compose_summary(req, prompt_text)
+        elif req.purpose == "judge":
+            text = _fake_verdict(prompt_text)
         return ChatResponse(
             text=text,
             model=req.model,
