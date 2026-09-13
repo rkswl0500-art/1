@@ -25,6 +25,21 @@ from .models import RUBRIC_KEYS, AnonUtterance, ChatRequest, Issue, Message
 REASONING_CHARS = 120
 
 
+def verdict_content_tokens(issue_count: int, participant_count: int) -> int:
+    """판정 JSON 본문의 예상 크기(토큰).
+
+    예산 계산과 비용 견적이 **같은 함수**를 씁니다. 예전에는 각자 따로 추정했고,
+    견적 쪽은 쟁점 수를 아예 반영하지 않는 고정값(300~1200자)이었습니다 —
+    쟁점이 4개인 실행에서 견적이 실제보다 낮게 나온 이유입니다.
+    """
+    return (
+        300                                              # JSON 뼈대 + margin/winner
+        + issue_count * (80 + 20 * participant_count)    # per_issue: 점수 + reasoning
+        + participant_count * 15 * len(RUBRIC_KEYS)      # rubric 각 축
+        + 300                                            # conclusion + dissent
+    )
+
+
 def required_output_tokens(
     issue_count: int, participant_count: int, *,
     thinking_reserve: int = 6000, cap: int = 32768,
@@ -41,12 +56,7 @@ def required_output_tokens(
 
     사고 몫을 배수로 처리하면 쟁점이 적을 때 모자라고 많을 때 과합니다.
     """
-    content = (
-        300                                              # JSON 뼈대 + margin/winner
-        + issue_count * (80 + 20 * participant_count)    # per_issue: 점수 + reasoning
-        + participant_count * 15 * len(RUBRIC_KEYS)      # rubric 각 축
-        + 300                                            # conclusion + dissent
-    )
+    content = verdict_content_tokens(issue_count, participant_count)
     return min(cap, thinking_reserve + int(content * 1.5))
 
 

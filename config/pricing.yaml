@@ -22,6 +22,13 @@ models:
     input_per_1m: 0.0
     output_per_1m: 0.0
 
+  # ── Groq 무료 티어 (2026-09 실측) ──────────────────────────────────────
+  # 모델 ID 에 '/' 가 들어갑니다. 참가자/judge 지정은 첫 '/' 로 프로바이더를
+  # 가르므로 `groq/openai/gpt-oss-120b` 로 씁니다.
+  openai/gpt-oss-120b:
+    input_per_1m: 0.0
+    output_per_1m: 0.0
+
   # ── fake 모드 전용 ────────────────────────────────────────────────────
   fake-a:
     input_per_1m: 0.0

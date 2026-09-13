@@ -97,6 +97,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .win{color:var(--ok);font-weight:700}
 .note{font-size:12px;color:var(--muted);margin-top:8px}
 .fail{color:var(--bad);font-weight:700}
+.warn-t{color:var(--warn);font-weight:600}
 .judging{display:flex;align-items:center;gap:8px;color:var(--accent);font-weight:600}
 .judging .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1.1s ease-in-out infinite}
 #log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;
@@ -150,23 +151,31 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
         <label>개입 대기(초)</label><input id="gatesec" type="number" value="120" min="0" max="1800">
       </div>
     </div>
-    <label>참가자 — 한 줄에 <code>provider/model | 입장 | 페르소나</code>
-      <span class="note" style="margin:0">(입장·페르소나는 선택. 구분자는
-      <code>|</code> — 모델 ID 에 콜론이 들어가므로)</span></label>
-    <textarea id="agents" rows="4">fake/fake-a | 찬성 | 데이터와 측정 방법을 중시하는 실증주의자
-fake/fake-b | 반대 | 조직 문화와 암묵지 전수를 중시하는 현장주의자
-fake/fake-c | 중립 | 비용과 트레이드오프를 따지는 회의주의자</textarea>
-    <div class="row" style="margin-top:4px">
-      <span class="note" style="margin:0">빠른 입력:</span>
-      <button class="chip" data-fill="찬반">찬성/반대 2명</button>
-      <button class="chip" data-fill="삼자">찬성/반대/중립 3명</button>
-      <button class="chip" data-fill="무입장">입장 없이</button>
+    <label>참가자 <span class="note" style="margin:0">— 프로바이더를 고르면 모델
+      목록을 불러옵니다. 입장을 비우면 수렴하거나 라운드마다 뒤집힙니다.</span></label>
+    <div id="p-rows"></div>
+    <div class="row" style="margin-top:6px">
+      <button class="ghost" id="p-add">＋ 참가자 추가</button>
+      <span class="note" style="margin:0">입장 일괄:</span>
+      <button class="chip" data-fill="찬반">찬성/반대</button>
+      <button class="chip" data-fill="삼자">찬성/반대/중립</button>
+      <button class="chip" data-fill="무입장">비우기</button>
+      <button class="chip" id="p-raw">직접 입력으로 전환</button>
+    </div>
+    <div id="p-rawbox" hidden style="margin-top:8px">
+      <label>한 줄에 <code>provider/model | 입장 | 페르소나</code></label>
+      <textarea id="agents" rows="4"></textarea>
     </div>
     <div class="note" id="stance-hint" style="margin-top:6px"></div>
     <div class="row" style="margin-top:8px">
-      <div style="flex:1;min-width:200px">
-        <label>Judge (provider/model, 비우면 판정 없음)</label>
-        <input id="judge" value="fake/fake-judge">
+      <div style="flex:1;min-width:260px">
+        <label>Judge <span class="note" style="margin:0">— 비우면 판정 없음</span></label>
+        <div class="row">
+          <select id="j-prov" style="flex:1"></select>
+          <span id="j-model-wrap" style="flex:2"></span>
+        </div>
+        <input id="judge" hidden>
+        <div class="note" id="j-family"></div>
       </div>
       <label style="width:auto;margin:0"><input type="checkbox" id="usefake" checked
         style="width:auto;margin-right:6px">fake 모드</label>
@@ -546,55 +555,209 @@ const PRESETS = {
          '중립 | 비용과 트레이드오프를 따지는 회의주의자'],
   무입장: null,
 };
-// 입장 미지정의 한계를 실측 그대로 알려줍니다. 경고가 아니라 안내입니다 —
-// 입장 없이 돌리는 것도 유효한 실험이고, 다만 무엇이 일어나는지는 알아야 합니다.
+// ── 참가자 행 ──────────────────────────────────────────────────────────────
+// 텍스트 한 줄을 직접 쓰는 대신 드롭다운으로 고릅니다. 모델 목록은 등록된
+// 슬롯의 /models 에서 가져오고, 실패하면 그 자리에서 직접 입력으로 떨어집니다 —
+// 목록을 못 불러온다고 토론을 못 열면 안 됩니다.
+const STANCES = ['찬성', '반대', '중립'];
 const STANCE_HINT =
   '입장을 지정하지 않으면 같은 모델끼리 <strong>같은 편으로 수렴</strong>하거나, ' +
-  '라운드마다 <strong>입장이 바뀔</strong> 수 있습니다. ' +
-  '실측에서 둘 다 관찰됐습니다 — R1 전원 찬성, R2 에서 서로 자기 R1 주장을 반박.';
+  '라운드마다 <strong>입장이 바뀔</strong> 수 있습니다. 실측에서 둘 다 관찰됐습니다.';
+
+let providers = [];              // 등록된 슬롯 이름 + fake
+let modelCache = {};             // provider -> {models:[], error:null}
+let rows = [];                   // {provider, model, stance, persona, free:bool}
+let rawMode = false;
+
+const vendorOf = m => (m.split('/').pop() || m).toLowerCase().split(/[-_.:]/)[0];
+
+async function loadProviders(){
+  try{
+    const j = await (await fetch('/providers')).json();
+    providers = [...j.providers, j.fake];
+  }catch{ providers = ['fake']; }
+  if(!rows.length){
+    const p = providers.includes('fake') ? 'fake' : providers[0];
+    rows = [{provider:p, model:'', stance:'찬성', persona:'', free:false},
+            {provider:p, model:'', stance:'반대', persona:'', free:false}];
+  }
+  await Promise.all(providers.map(loadModels));
+  renderRows(); renderJudge();
+}
+
+async function loadModels(prov){
+  if(modelCache[prov]) return modelCache[prov];
+  try{
+    const r = await fetch(`/models?provider=${encodeURIComponent(prov)}`);
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.detail || '목록 실패');
+    modelCache[prov] = {models: j.models, error: null};
+  }catch(err){ modelCache[prov] = {models: [], error: err.message}; }
+  return modelCache[prov];
+}
+
+function modelField(scope, i, prov, value, free){
+  const c = modelCache[prov] || {models: [], error: '불러오는 중'};
+  if(free || !c.models.length){
+    const why = c.error ? ` <span class="fail">목록 실패: ${c.error}</span>` : '';
+    return `<input data-s="${scope}" data-i="${i}" data-k="model"
+              placeholder="모델 ID 직접 입력" value="${value}">${why}`;
+  }
+  const opts = c.models.map(m =>
+    `<option${m === value ? ' selected' : ''}>${m}</option>`).join('');
+  return `<select data-s="${scope}" data-i="${i}" data-k="model">
+            <option value="">— 모델 선택 —</option>${opts}</select>`;
+}
+
+function renderRows(){
+  $('p-rows').innerHTML = rows.map((r,i)=>`
+    <div class="slot">
+      <div class="row">
+        <div class="f"><label>프로바이더</label>
+          <select data-s="p" data-i="${i}" data-k="provider">
+            ${providers.map(p=>`<option${p===r.provider?' selected':''}>${p}</option>`).join('')}
+          </select></div>
+        <div class="f wide"><label>모델</label>
+          ${modelField('p', i, r.provider, r.model, r.free)}</div>
+        <div class="f"><label>입장</label>
+          <select data-s="p" data-i="${i}" data-k="stance">
+            <option value=""${r.stance?'':' selected'}>— 없음 —</option>
+            ${STANCES.map(s=>`<option${s===r.stance?' selected':''}>${s}</option>`).join('')}
+            <option value="__free"${r.stance && !STANCES.includes(r.stance)?' selected':''}>직접 입력…</option>
+          </select></div>
+        <div class="f wide"><label>페르소나 (선택)</label>
+          <input data-s="p" data-i="${i}" data-k="persona" value="${r.persona}"
+                 placeholder="예: 데이터와 측정 방법을 중시하는 실증주의자"></div>
+        <button class="chip" data-prm="${i}">${r.free?'목록에서':'직접 입력'}</button>
+        <button class="chip" data-pdel="${i}"${rows.length<=2?' disabled':''}>삭제</button>
+      </div>
+    </div>`).join('');
+  bind('p-rows', 'p');
+  $('p-rows').querySelectorAll('[data-pdel]').forEach(b => b.onclick = () => {
+    rows.splice(+b.dataset.pdel, 1); renderRows(); renderJudge();
+  });
+  $('p-rows').querySelectorAll('[data-prm]').forEach(b => b.onclick = () => {
+    const r = rows[+b.dataset.prm]; r.free = !r.free; renderRows();
+  });
+  refreshStanceHint();
+}
+
+function bind(container, scope){
+  $(container).querySelectorAll('[data-s="'+scope+'"]').forEach(el => {
+    el.onchange = el.oninput = async () => {
+      const target = scope === 'p' ? rows[+el.dataset.i] : judgeSel;
+      const k = el.dataset.k;
+      if(k === 'stance' && el.value === '__free'){
+        const v = prompt('입장을 직접 입력하세요', target.stance || '');
+        target.stance = v || ''; renderRows(); return;
+      }
+      target[k] = el.value;
+      if(k === 'provider'){ target.model = ''; await loadModels(el.value);
+                            scope === 'p' ? renderRows() : renderJudge(); return; }
+      if(scope === 'p') refreshStanceHint(); else renderJudge();
+    };
+  });
+}
 
 function refreshStanceHint(){
-  const lines = $('agents').value.split('\n').map(s=>s.trim()).filter(Boolean);
-  const missing = lines.filter(l => !(l.split('|')[1] || '').trim()).length;
+  const missing = currentRows().filter(r => !r.stance).length;
   $('stance-hint').innerHTML = missing
     ? `입장 미지정 ${missing}명 · ${STANCE_HINT}` : '';
 }
-$('agents').addEventListener('input', refreshStanceHint);
 
-// [data-fill] 로 좁힙니다. '.chip' 전체를 잡으면 설정 패널의 토글·프리셋
-// 버튼까지 물려서 그쪽 핸들러를 덮어씁니다 — 실제로 그래서 설정 패널이
-// 열리지 않았습니다.
+// ── Judge ──────────────────────────────────────────────────────────────────
+let judgeSel = {provider:'fake', model:'fake-judge', free:false};
+
+function renderJudge(){
+  $('j-prov').innerHTML = '<option value="">— 판정 없음 —</option>' +
+    providers.map(p=>`<option${p===judgeSel.provider?' selected':''}>${p}</option>`).join('');
+  // 컨테이너는 고정해 두고 안쪽만 갈아끼웁니다. outerHTML 로 자기 자신을
+  // 바꾸면 다음 렌더에서 id 가 엉뚱한 요소에 붙습니다 — 실제로 #j-model 이
+  // select 가 아니라 span 을 가리켰습니다.
+  $('j-model-wrap').innerHTML = judgeSel.provider
+    ? modelField('j', 0, judgeSel.provider, judgeSel.model, judgeSel.free)
+    : '';
+  $('j-prov').onchange = async () => {
+    judgeSel.provider = $('j-prov').value; judgeSel.model = '';
+    if(judgeSel.provider) await loadModels(judgeSel.provider);
+    renderJudge();
+  };
+  bind('j-model-wrap', 'j');
+  $('judge').value = judgeSel.provider && judgeSel.model
+    ? `${judgeSel.provider}/${judgeSel.model}` : '';
+  renderFamily();
+}
+
+// 벤더가 겹치는지는 **고르는 시점에** 보여줍니다. 실행이 끝난 뒤에 알면
+// 이미 그 점수로 채점이 끝난 뒤입니다.
+function renderFamily(){
+  const el = $('j-family');
+  if(!judgeSel.model){ el.textContent = ''; return; }
+  const jv = vendorOf(judgeSel.model);
+  const pv = [...new Set(currentRows().filter(r=>r.model).map(r=>vendorOf(r.model)))];
+  if(!pv.length){ el.textContent = ''; return; }
+  const same = pv.includes(jv);
+  const exact = currentRows().some(r => r.model === judgeSel.model);
+  el.innerHTML = exact
+    ? `<span class="fail">참가자와 <strong>같은 모델</strong>입니다 — 실행이 거부됩니다.</span>`
+    : same
+      ? `<span class="warn-t">judge: ${jv} 계열 — 참가자와 같은 계열입니다 (${pv.join(', ')}).
+         자기편애가 점수에 남을 수 있습니다.</span>`
+      : `judge: ${jv} 계열 · 참가자: ${pv.join(', ')} — 계열이 다릅니다.`;
+}
+
+function currentRows(){
+  if(!rawMode) return rows;
+  return $('agents').value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
+    const [head, stance, persona] = line.split('|').map(x=>x.trim());
+    const i = head.indexOf('/');
+    return {provider: head.slice(0,i), model: head.slice(i+1),
+            stance: stance||'', persona: persona||''};
+  });
+}
+
+function toRaw(){
+  return rows.map(r => [`${r.provider}/${r.model}`, r.stance, r.persona]
+    .filter((x,i)=>i===0||x).join(' | ')).join('\n');
+}
+
+$('p-add').onclick = () => {
+  const last = rows[rows.length-1] || {provider: providers[0]};
+  rows.push({provider:last.provider, model:'', stance:'', persona:'', free:false});
+  renderRows(); renderJudge();
+};
+$('p-raw').onclick = () => {
+  rawMode = !rawMode;
+  if(rawMode) $('agents').value = toRaw();
+  else { rows = currentRows().map(r=>({...r, free:true})); renderRows(); }
+  $('p-rows').hidden = rawMode;
+  $('p-rawbox').hidden = !rawMode;
+  $('p-raw').textContent = rawMode ? '드롭다운으로 전환' : '직접 입력으로 전환';
+  renderJudge();
+};
 document.querySelectorAll('.chip[data-fill]').forEach(btn => btn.onclick = () => {
-  const heads = $('agents').value.split('\n')
-                  .map(s => s.split('|')[0].trim()).filter(Boolean);
-  if(!heads.length) heads.push('fake/fake-a');
-  const tails = PRESETS[btn.dataset.fill];
-  if(tails === null){                       // 입장만 지우고 참가자 수는 유지
-    $('agents').value = heads.join('\n');
-    refreshStanceHint();
-    return;
+  const fill = {찬반:['찬성','반대'], 삼자:['찬성','반대','중립'], 무입장:null}[btn.dataset.fill];
+  if(fill === null){ rows.forEach(r => r.stance = ''); }
+  else {
+    while(rows.length < fill.length) rows.push(
+      {provider:rows[0].provider, model:'', stance:'', persona:'', free:false});
+    rows = rows.slice(0, Math.max(fill.length, rows.length));
+    rows.forEach((r,i) => r.stance = fill[i] || '');
   }
-  $('agents').value = tails.map((tail, i) =>
-    `${heads[i] || heads[heads.length - 1]} | ${tail}`).join('\n');
-  refreshStanceHint();
+  renderRows(); renderJudge();
 });
-refreshStanceHint();
 
 $('btn-create').onclick = async () => {
   $('setup-msg').textContent = '견적 계산 중…';
   try{
-    const agents = $('agents').value.split('\n').map(s=>s.trim()).filter(Boolean)
-      .map(line => {
-        // 'provider/model | 입장 | 페르소나'. 구분자가 '|' 인 이유는 모델 ID 에
-        // 콜론이 들어가기 때문입니다 (OpenRouter 의 ':free').
-        const [head, stance, persona] = line.split('|').map(x => x.trim());
-        const i = head.indexOf('/');
-        if(i < 0) throw new Error(`'${head}' — provider/model 형식이 아닙니다`);
-        const p = {provider: head.slice(0, i), model: head.slice(i + 1)};
-        if(stance) p.stance = stance;
-        if(persona) p.persona = persona;
-        return p;
-      });
+    const agents = currentRows().map(r => {
+      if(!r.provider || !r.model) throw new Error('프로바이더와 모델을 모두 고르세요');
+      const p = {provider: r.provider, model: r.model};
+      if(r.stance) p.stance = r.stance;
+      if(r.persona) p.persona = r.persona;
+      return p;
+    });
+    if(agents.length < 2) throw new Error('참가자는 2명 이상이어야 합니다');
     const j = await post('/debates', {
       topic:$('topic').value, participants:agents, rounds:+$('rounds').value,
       judge: $('judge').value.trim() || null, use_fake: $('usefake').checked,
@@ -638,6 +801,8 @@ $('btn-skip').onclick = async () => {
 };
 
 // 새로고침해도 이어서 보기: ?id=... 로 재접속하면 버퍼된 이벤트가 재생됩니다.
+loadProviders();
+
 const qs = new URLSearchParams(location.search);
 if(qs.get('id')){
   debateId = qs.get('id');

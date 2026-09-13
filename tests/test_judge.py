@@ -321,3 +321,30 @@ async def test_fake_judge_covers_every_rubric_axis():
 
     for label, scores in rubric.items():
         assert set(scores) == set(RUBRIC_KEYS), f"{label}: {sorted(scores)}"
+
+
+@pytest.mark.parametrize("model,family", [
+    ("models/gemini-3.6-flash", "gemini"),
+    ("gemini-3.5-flash-lite", "gemini"),
+    ("openai/gpt-oss-120b", "gpt"),
+    ("gpt-4o-mini", "gpt"),
+    ("llama-3.3-70b:free", "llama"),
+    ("claude-sonnet-5", "claude"),
+])
+def test_vendor_family_matches_what_the_ui_computes(model, family):
+    """UI 가 고르는 시점에 같은 계열인지 알려주려고 클라이언트에서도 같은 판정을
+    합니다(index.html 의 vendorOf). 두 구현이 어긋나면 화면과 기록이 다른 말을
+    하므로, 서버 쪽을 바꾸면 그쪽도 같이 고쳐야 합니다."""
+    assert vendor_family(model) == family
+
+
+def test_verdict_size_has_one_definition():
+    """예산(judge)과 견적(cost)이 각자 추정하면 한쪽만 갱신되어 어긋납니다.
+    실제로 견적 쪽은 쟁점 수를 아예 반영하지 않는 고정값이었습니다."""
+    from debate.judge import required_output_tokens, verdict_content_tokens
+
+    assert verdict_content_tokens(5, 3) > verdict_content_tokens(3, 3)
+    assert verdict_content_tokens(3, 5) > verdict_content_tokens(3, 3)
+    # 예산 = 사고 몫 + 내용 몫 × 1.5
+    assert required_output_tokens(4, 2, thinking_reserve=0) == int(
+        verdict_content_tokens(4, 2) * 1.5)

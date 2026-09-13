@@ -291,20 +291,24 @@ class PricingTable:
         return cls(out)
 
     def _lookup(self, model: str) -> "ModelPrice | None":
-        """접두사 유무를 가리지 않고 찾습니다.
+        """접두사가 붙어 있든 없든 찾습니다.
 
-        같은 모델이 요청에서는 `models/gemini-3.6-flash`, 응답에서는
-        `gemini-3.6-flash` 로 오는 경우가 있습니다. 가격표를 어느 쪽으로 적든
-        맞도록 양쪽을 다 시도합니다 — 접두사 하나 때문에 "가격 미상" 경고가
-        뜨면 그 경고는 신호 구실을 못 합니다.
+        같은 모델이 요청과 응답에서 다르게 옵니다 — `models/gemini-3.6-flash` 와
+        `gemini-3.6-flash`, `openai/gpt-oss-120b` 와 `gpt-oss-120b`. 접두사 하나
+        때문에 "가격 미상" 경고가 뜨면 그 경고는 신호 구실을 못 합니다.
+
+        벤더 접두사를 목록으로 두지 않고 **마지막 구간이 일치하는 키**를 찾습니다.
+        후보가 둘 이상이면 포기합니다 — 엉뚱한 단가를 붙이느니 모른다고 하는
+        편이 낫습니다.
         """
         price = self._prices.get(model)
         if price is not None:
             return price
-        bare = model.rsplit("/", 1)[-1]
-        if bare != model and (price := self._prices.get(bare)) is not None:
-            return price
-        return self._prices.get(f"models/{model}")
+
+        tail = model.rsplit("/", 1)[-1]
+        matches = [p for key, p in self._prices.items()
+                   if key == tail or key.rsplit("/", 1)[-1] == tail]
+        return matches[0] if len(matches) == 1 else None
 
     def cost_for(self, model: str, usage: Usage) -> tuple[Decimal, bool]:
         """(비용, 가격을 알고 있었는가) 를 돌려줍니다."""

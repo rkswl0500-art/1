@@ -9,6 +9,7 @@ from decimal import Decimal
 from .config import PricingTable
 from typing import Sequence
 
+from .judge import verdict_content_tokens
 from .models import CallRecord, Usage, build_header
 
 _HANGUL = (
@@ -190,6 +191,7 @@ class Estimator:
     def estimate(
         self, *, participants: Sequence, rounds: int, judge_model: str | None,
         moderator_model: str | None = None, topic: str = "",
+        issue_count: int = 4,
     ) -> CostEstimate:
         n = len(participants)
         per_model_lo: dict[str, Decimal] = {}
@@ -242,8 +244,12 @@ class Estimator:
         if judge_model:
             # Judge 는 전 라운드 전문을 한 번에 봅니다 — 단일 패스이므로.
             before_hi, before_usd = tok_hi, sum(per_model_hi.values(), Decimal(0))
+            # 판정 출력은 쟁점·참가자·루브릭 축 수에 비례합니다. judge.py 가
+            # 예산을 잡을 때 쓰는 함수를 그대로 씁니다 — 따로 추정하면 한쪽만
+            # 갱신되어 어긋납니다(실제로 견적 쪽이 쟁점 수를 무시하고 있었습니다).
+            content = verdict_content_tokens(issue_count, n)
             add(judge_model, self._tok(sum(transcript_hi) + _ISSUES_CHARS),
-                self._tok(300), self._tok(1200))
+                content // 2, content)
             # 복구 호출은 같은 프롬프트를 다시 보내는 것이라 한 번 더 친 것과
             # 비슷합니다. 본 범위가 아니라 별도 항목으로 냅니다.
             repair_tokens = tok_hi - before_hi

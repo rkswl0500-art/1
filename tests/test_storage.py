@@ -338,3 +338,50 @@ def test_repair_allowance_is_shown_in_the_formatted_output():
     text = _estimator().estimate(participants=_specs(2), rounds=2,
                                  judge_model="m", topic="주제").format()
     assert "판정 복구가 붙으면" in text
+
+
+def test_judge_estimate_scales_with_issue_count():
+    """판정 출력은 쟁점마다 per_issue 항목이 붙어 길어집니다. 고정값으로 두면
+    쟁점이 많은 토론에서 견적이 낮게 나옵니다."""
+    est = _estimator()
+    three = est.estimate(participants=_specs(2), rounds=2, judge_model="m",
+                         topic="주제", issue_count=3)
+    five = est.estimate(participants=_specs(2), rounds=2, judge_model="m",
+                        topic="주제", issue_count=5)
+
+    assert five.tokens_high > three.tokens_high
+
+
+def test_judge_estimate_uses_the_same_model_as_the_budget():
+    from debate.judge import verdict_content_tokens
+
+    est = _estimator()
+    with_judge = est.estimate(participants=_specs(2), rounds=2, judge_model="m",
+                              topic="주제", issue_count=4)
+    without = est.estimate(participants=_specs(2), rounds=2, judge_model=None,
+                           topic="주제", issue_count=4)
+
+    judge_out = with_judge.tokens_high - without.tokens_high
+    # 판정 몫 = 입력(전사) + 출력(내용 추정). 출력이 내용 추정과 맞아야 합니다.
+    assert judge_out > verdict_content_tokens(4, 2)
+
+
+def test_pricing_matches_any_vendor_prefix():
+    """models/ 만 특별취급하던 것을 일반화했습니다 — Groq 모델은
+    openai/gpt-oss-120b 처럼 다른 접두사를 씁니다."""
+    from debate.config import ModelPrice, PricingTable
+
+    t = PricingTable({"openai/gpt-oss-120b": ModelPrice(Decimal(1), Decimal(2))})
+    assert t.cost_for("openai/gpt-oss-120b", Usage(1_000_000, 0))[1] is True
+    assert t.cost_for("gpt-oss-120b", Usage(1_000_000, 0))[1] is True
+    assert t.cost_for("groq/openai/gpt-oss-120b", Usage(1_000_000, 0))[1] is True
+
+
+def test_ambiguous_bare_name_is_reported_unpriced():
+    """접두사만 다른 동명 모델이 둘이면 아무거나 고르지 않습니다 — 엉뚱한 단가를
+    붙이느니 모른다고 하는 편이 낫습니다."""
+    from debate.config import ModelPrice, PricingTable
+
+    t = PricingTable({"a/m": ModelPrice(Decimal(1), Decimal(1)),
+                      "b/m": ModelPrice(Decimal(9), Decimal(9))})
+    assert t.cost_for("m", Usage(1_000_000, 0)) == (Decimal(0), False)
