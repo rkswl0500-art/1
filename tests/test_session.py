@@ -308,3 +308,41 @@ async def test_finished_reports_the_debate_outcome_not_just_that_run_returned():
     assert last["status"] == "aborted_insufficient_participants"
     assert last["run_status"] == "completed"      # 둘을 구분해서 싣습니다
     assert last["judge_error"] == "RetryableError: 심판 무응답"
+
+
+async def test_judge_is_skipped_when_no_participant_succeeded():
+    """빈 기록을 채점시킬 이유가 없습니다. 참가자가 전원 죽으면 심판도 건너뜁니다."""
+    from debate.models import AgentSpec, DebateResult, RoundResult, Usage, Utterance
+    from decimal import Decimal
+
+    session = _runnable_session()
+    failed = Utterance("p1", 1, "", Usage(0, 0), 0, Decimal(0),
+                       status="failed", error="boom")
+    session.result = DebateResult(
+        debate_id="d", topic="t",
+        participants=(AgentSpec("p1", "참가자 A", "fake", "m", "x"),),
+        rounds=(RoundResult(1, (failed,), 0, 0, 1),))
+
+    assert session._has_content() is False
+
+
+async def test_judge_runs_when_at_least_one_utterance_succeeded():
+    from debate.models import AgentSpec, DebateResult, RoundResult, Usage, Utterance
+    from decimal import Decimal
+
+    session = _runnable_session()
+    ok = Utterance("p1", 1, "발언", Usage(1, 1), 1, Decimal(0))
+    session.result = DebateResult(
+        debate_id="d", topic="t",
+        participants=(AgentSpec("p1", "참가자 A", "fake", "m", "x"),),
+        rounds=(RoundResult(1, (ok,), 0, 0, 1),))
+
+    assert session._has_content() is True
+
+
+def test_judge_timeout_accommodates_a_slow_thinking_model():
+    """라이브에서 사고형 심판이 3~4분 걸렸습니다. 180초면 정상 판정을 끊습니다."""
+    from debate.config import Settings
+
+    s = Settings(_env_file=None)
+    assert s.judge_timeout_s >= 240

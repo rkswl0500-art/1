@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 import itertools
 import json
 import string
@@ -283,8 +284,18 @@ def _resolve_judge(args, specs: list[AgentSpec], settings) -> tuple[str, str] | 
 def _print_verdict(verdict) -> None:
     print(f"\n{'─' * 60}\n판정 (judge: {verdict.judge_model})")
     if verdict.status == "unparsed":
-        print("  ⚠ 판정을 파싱하지 못했습니다. 원문만 저장했습니다.")
-        print(f"  원문 앞부분: {verdict.raw[:200]!r}")
+        # "파싱 실패"로만 적으면 형식 문제로 오해합니다. 잘린 것은 예산 문제라
+        # 대처가 완전히 다릅니다.
+        if verdict.failure_kind == "truncated":
+            print("  ⚠ 판정이 길이 제한에 걸려 중간에 잘렸습니다 "
+                  "(finish_reason=length). 형식 문제가 아닙니다.")
+            print(f"     DEBATE_JUDGE_MAX_TOKENS 를 올리거나(현재 자동 계산) "
+                  f"쟁점 수를 줄이십시오. 시도 {verdict.parse_attempts}회.")
+        else:
+            print("  ⚠ 판정이 올바른 JSON 이 아니었습니다 (형식 오류). "
+                  f"시도 {verdict.parse_attempts}회.")
+        print(f"  원문 {len(verdict.raw)}자, verdicts.raw 에 저장했습니다.")
+        print(f"  앞부분: {verdict.raw[:160]!r}")
         return
 
     for score in verdict.per_issue:
@@ -525,25 +536,35 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         _preview_context(builder, specs, cfg)
 
     progress = _Progress({s.id: s.label for s in specs}, concurrency)
+    verdict = None
+    # 풀은 **판정까지 끝난 뒤에** 닫습니다. 심판도 같은 풀을 쓰므로 여기서
+    # 먼저 닫으면 실제 HTTP 클라이언트가 "client has been closed" 로 죽습니다.
+    # fake 프로바이더는 aclose() 가 no-op 이라 fake 검증으로는 안 잡힙니다.
     try:
         result = await DebateEngine(
             agents, builder, moderator, anonymizer, sink=progress
         ).run(cfg)
-    finally:
-        await pool.aclose()
 
-    verdict = None
-    if judge_spec and result.rounds:
         anon_transcript = tuple(
             anonymizer.to_anon(u)
             for r in result.rounds for u in r.utterances if u.status == "ok"
         )
-        judge = Judge(pool.get(judge_spec[0]), judge_spec[1],
-                      timeout_s=settings.request_timeout_s)
-        verdict = await judge.evaluate(
-            topic, result.issues, anon_transcript,
-            labels=[s.label for s in specs],
-        )
+        if judge_spec and anon_transcript:
+            judge = Judge(pool.get(judge_spec[0]), judge_spec[1],
+                          max_tokens=settings.judge_max_tokens or None,
+                          timeout_s=settings.request_timeout_s)
+            print(f"\n판정 중 — {judge_spec[1]} (쟁점 {len(result.issues)}개)", flush=True)
+            started = time.perf_counter()
+            verdict = await asyncio.wait_for(
+                judge.evaluate(topic, result.issues, anon_transcript,
+                               labels=[s.label for s in specs]),
+                settings.judge_timeout_s)
+            print(f"  판정 완료 ({time.perf_counter() - started:.1f}초)", flush=True)
+    except asyncio.TimeoutError:
+        print(f"\n판정 실패: {settings.judge_timeout_s:.0f}초 안에 응답하지 않았습니다 "
+              "(DEBATE_JUDGE_TIMEOUT_S)", file=sys.stderr)
+    finally:
+        await pool.aclose()
 
     _print_result(result, meter)
     if verdict is not None:

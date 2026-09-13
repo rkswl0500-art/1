@@ -163,3 +163,87 @@ def test_family_note_states_a_fact_without_blocking():
     assert "참가자와 다름" in diff.line()
     # 사실 진술이지 경고가 아닙니다
     assert "경고" not in diff.line() and "주의" not in diff.line()
+
+
+# ── 출력 예산과 잘림 (라이브에서 드러남) ────────────────────────────────────
+
+
+def test_budget_scales_with_issues_and_participants():
+    """쟁점·참가자가 늘면 판정 JSON 도 길어집니다. 고정값이면 큰 토론에서 잘립니다."""
+    from debate.judge import required_output_tokens as need
+
+    assert need(5, 2) > need(3, 2)
+    assert need(3, 5) > need(3, 2)
+
+
+def test_budget_reserves_a_fixed_share_for_thinking():
+    """사고 몫은 모델 속성이지 쟁점 수의 함수가 아닙니다. 배수로 처리하면
+    쟁점이 적을 때 모자라고 많을 때 과합니다."""
+    from debate.judge import required_output_tokens as need
+
+    thinking = need(4, 2) - need(4, 2, thinking_reserve=0)
+    assert thinking == 6000
+    # 사고 몫을 뺀 내용 몫은 라이브에서 관측된 판정 JSON 크기(~1,000 토큰) 수준
+    assert 1000 <= need(4, 2, thinking_reserve=0) <= 3000
+
+
+def test_default_budget_exceeds_the_size_that_truncated_live():
+    """라이브에서 4,096 으로 JSON 이 중간에 끊겼습니다."""
+    from debate.judge import required_output_tokens as need
+
+    assert need(4, 2) > 4096
+
+
+async def test_truncated_verdict_is_labelled_truncated_not_malformed():
+    """둘을 '파싱 실패'로 묶으면 예산 문제를 프롬프트 문제로 오해합니다."""
+    class Truncating(ScriptedProvider):
+        async def chat(self, req):
+            from dataclasses import replace
+            return replace(await super().chat(req), finish_reason="length")
+
+    v = await Judge(Truncating('{"per_issue": [{"issue_id": "i1"',
+                               '{"per_issue": [{"issue_id": "i1"'),
+                    "m").evaluate("주제", ISSUES, TRANSCRIPT, LABELS)
+
+    assert v.status == "unparsed"
+    assert v.failure_kind == "truncated"
+    assert v.finish_reason == "length"
+
+
+async def test_malformed_verdict_is_labelled_malformed():
+    v, _ = await _judge("이건 JSON 이 아닙니다", "여전히 아닙니다")
+    assert v.status == "unparsed"
+    assert v.failure_kind == "malformed"
+
+
+async def test_length_failure_raises_the_budget_and_asks_for_brevity():
+    """같은 예산으로 다시 부르면 같은 자리에서 또 잘립니다. 예산만 올리면
+    장황한 모델은 늘어난 만큼 더 씁니다 — 둘 다 해야 합니다."""
+    budgets: list[int] = []
+
+    class Truncating(ScriptedProvider):
+        async def chat(self, req):
+            from dataclasses import replace
+            budgets.append(req.max_tokens)
+            resp = await super().chat(req)
+            return replace(resp, finish_reason="length" if len(budgets) == 1 else "stop")
+
+    provider = Truncating('{"per_issue": [{"issue_id"', GOOD)
+    v = await Judge(provider, "m").evaluate("주제", ISSUES, TRANSCRIPT, LABELS)
+
+    assert v.status == "ok"                       # 복구 성공
+    assert budgets[1] == budgets[0] * 2           # 예산 2배
+    repair = provider.requests[1].messages[-1].content
+    assert "한 문장" in repair                     # 동시에 더 짧게 지시
+    # 잘린 본문을 되돌려 보내지 않습니다 — 예산만 먹습니다
+    assert not any(m.role == "assistant" for m in provider.requests[1].messages)
+
+
+def test_prompt_caps_reasoning_length():
+    """쟁점당 2~3문장이면 충분하고, 길수록 잘릴 위험만 커집니다."""
+    from debate.judge import REASONING_CHARS, _PROMPT
+
+    rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS)
+    assert f"{REASONING_CHARS}자 이내" in rendered
+    assert "JSON 을 반드시 닫으십시오" in rendered
+    assert 80 <= REASONING_CHARS <= 200

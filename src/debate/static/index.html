@@ -87,6 +87,8 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .win{color:var(--ok);font-weight:700}
 .note{font-size:12px;color:var(--muted);margin-top:8px}
 .fail{color:var(--bad);font-weight:700}
+.judging{display:flex;align-items:center;gap:8px;color:var(--accent);font-weight:600}
+.judging .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1.1s ease-in-out infinite}
 #log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;
   color:var(--muted);max-height:150px;overflow:auto;white-space:pre-wrap}
 </style>
@@ -284,14 +286,22 @@ function handle(ev){
     case 'awaiting_directive':
       $('status-line').textContent = `제${ev.round_no}라운드 시작 전 — 지시 대기 중`;
       openGate(ev.round_no, ev.timeout_s); break;
-    case 'verdict': showVerdict(ev); break;
-    case 'verdict_failed':
+    case 'judging_started': startJudging(ev); break;
+    case 'verdict': stopJudging(); showVerdict(ev); break;
+    case 'verdict_failed': {
+      stopJudging();
       $('verdict-panel').style.display='block';
+      const head = ev.kind === 'truncated'
+        ? '판정이 <u>잘려서</u> 실패했습니다 (형식 문제 아님)'
+        : ev.kind === 'malformed'
+          ? '판정 형식이 올바르지 않았습니다'
+          : '판정을 받지 못했습니다';
       $('verdict').innerHTML =
-        `<div class="fail">판정을 받지 못했습니다.</div>
+        `<div class="fail">${head}</div>
          <div class="note">${ev.message}</div>
          <div class="note">토론 내용과 기록은 그대로 남아 있습니다.</div>`;
       break;
+    }
     case 'storage_failed':
       $('status-line').textContent += ' · 저장 실패';
       log('저장 실패: '+ev.message);
@@ -301,6 +311,7 @@ function handle(ev){
       // 재생해서 화면이 무한히 중복됩니다.
       closeStream();
       closeGate();
+      stopJudging();
       {
         const label = {
           completed: '완료',
@@ -333,6 +344,26 @@ function openGate(round, timeout){
   }, 200);
 }
 function closeGate(){ $('gate').classList.remove('on'); clearInterval(gateTick); }
+
+// 판정은 사고형 모델이면 몇 분 걸립니다. debate_completed 뒤로 화면이 조용하면
+// 멈춘 건지 도는 건지 구분되지 않으므로 경과 시간을 계속 돌립니다.
+let judgeTick = null;
+function startJudging(ev){
+  stopJudging();
+  $('verdict-panel').style.display='block';
+  $('verdict').innerHTML =
+    `<div class="judging"><span class="dot"></span>
+       <span>판정 중 — <span id="j-el">0.0</span>초 경과
+       <span class="note" style="margin:0">(쟁점 ${ev.issues}개 · 상한 ${ev.timeout_s}초)</span>
+     </span></div>`;
+  const t0 = Date.now();
+  $('status-line').textContent = '판정 중 — 심판이 전 라운드를 읽고 있습니다';
+  judgeTick = setInterval(() => {
+    const el = $('j-el'); if(!el) return;
+    el.textContent = ((Date.now()-t0)/1000).toFixed(1);
+  }, 100);
+}
+function stopJudging(){ if(judgeTick){ clearInterval(judgeTick); judgeTick = null; } }
 
 function showVerdict(v){
   $('verdict-panel').style.display='block';

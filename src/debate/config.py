@@ -93,7 +93,13 @@ class Settings(BaseSettings):
     #: 재시도 예산은 기본값에서 6분인데, 심판이 무응답이면 그 동안 화면에
     #: 아무 이벤트도 안 나가 멈춘 것처럼 보입니다. 판정은 단일 호출이라
     #: 토론만큼 오래 걸릴 이유가 없어 더 짧게 끊습니다.
-    judge_timeout_s: float = 180.0
+    #: 라이브에서 사고형 심판 모델이 3~4분 걸렸습니다. 180초면 정상 판정을
+    #: 중간에 끊습니다. 출력 길이를 잡으면 실제로는 훨씬 빨라질 것으로 보지만,
+    #: 그 전에 멀쩡한 판정을 죽이지 않도록 여유를 둡니다. 기다리는 동안
+    #: 화면에는 "판정 중"과 경과 시간이 표시됩니다.
+    judge_timeout_s: float = 300.0
+    #: 0 이면 쟁점·참가자 수에 맞춰 자동 계산합니다(judge.required_output_tokens).
+    judge_max_tokens: int = 0
 
     @property
     def retry_budget_s(self) -> float:

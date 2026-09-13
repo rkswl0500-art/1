@@ -20,6 +20,37 @@ from typing import Literal, Mapping, Sequence
 from .models import AnonUtterance, ChatRequest, Issue, Message
 
 RUBRIC_KEYS = ("근거", "논리", "반박", "명료성")
+
+#: reasoning 한 건의 상한(문자). 쟁점당 2~3문장이면 충분하고, 길수록 잘릴
+#: 위험만 커집니다.
+REASONING_CHARS = 120
+
+
+def required_output_tokens(
+    issue_count: int, participant_count: int, *,
+    thinking_reserve: int = 6000, cap: int = 32768,
+) -> int:
+    """판정 JSON 을 다 쓰고도 남을 출력 예산.
+
+    두 몫을 **더합니다**. 곱하지 않는 이유는 성격이 다르기 때문입니다:
+
+      내용 몫   쟁점·참가자 수에 비례합니다. 쟁점당 점수 + 짧은 reasoning,
+               참가자당 루브릭 4항목, 그리고 결론과 dissent.
+      사고 몫   모델의 속성이지 쟁점 수의 함수가 아닙니다. 사고 과정을 출력
+               예산에서 함께 쓰는 모델이 있고, 라이브에서 4,096 을 주고도
+               JSON 이 중간에 끊겼습니다(같은 실행에서 참가자 2초 / 심판 3~4분).
+
+    사고 몫을 배수로 처리하면 쟁점이 적을 때 모자라고 많을 때 과합니다.
+    """
+    content = (
+        300                                              # JSON 뼈대 + margin/winner
+        + issue_count * (80 + 20 * participant_count)    # per_issue: 점수 + reasoning
+        + participant_count * 60                         # rubric 4항목
+        + 300                                            # conclusion + dissent
+    )
+    return min(cap, thinking_reserve + int(content * 1.5))
+
+
 Margin = Literal["decisive", "narrow", "tie"]
 
 
@@ -47,6 +78,9 @@ class Verdict:
     #: "양쪽 다 좋은 지적을 했습니다" 류의 무의미한 총평을 냅니다.
     dissent: str
     status: Literal["ok", "unparsed"] = "ok"
+    #: unparsed 일 때 왜 실패했는지. "잘림"과 "형식 오류"는 대처가 다릅니다 —
+    #: 전자는 예산 문제, 후자는 프롬프트 문제입니다.
+    failure_kind: Literal["none", "truncated", "malformed"] = "none"
     raw: str = ""
     judge_model: str = ""
     prompt_tokens: int = 0
@@ -86,6 +120,10 @@ _PROMPT = """당신은 토론 심판입니다. 참가자가 아니며, 어느 �
 - 길이가 아니라 내용으로 채점하십시오.
 - "dissent" 에는 **승자가 끝내 답하지 못한 가장 강한 반론**을 쓰십시오.
   양비론이나 총평을 쓰지 마십시오.
+- 각 "reasoning" 은 **2~3문장, {reasoning_chars}자 이내**로 쓰십시오. 길게 쓰면
+  출력이 잘려 판정 전체가 무효가 됩니다.
+- "conclusion" 과 "dissent" 도 각각 2~3문장으로 제한하십시오.
+- **JSON 을 반드시 닫으십시오.** 중간에 끊기면 채점이 통째로 버려집니다.
 - 최고점이 동률이면 winner 를 null, margin 을 "tie" 로 하십시오.
 
 다른 말 없이 아래 JSON 만 출력하십시오.
@@ -99,10 +137,11 @@ _PROMPT = """당신은 토론 심판입니다. 참가자가 아니며, 어느 �
 
 
 class Judge:
-    def __init__(self, provider, model: str, *, max_tokens: int = 4096,
+    def __init__(self, provider, model: str, *, max_tokens: int | None = None,
                  timeout_s: float = 180.0, seed: int = 0) -> None:
         self._provider = provider
         self._model = model
+        #: None 이면 쟁점·참가자 수에 맞춰 evaluate() 에서 계산합니다.
         self._max_tokens = max_tokens
         self._timeout_s = timeout_s
         self._rng = random.Random(seed)
@@ -119,18 +158,22 @@ class Judge:
             "\n".join(f"  {i.id}) {i.title}" for i in issues) if issues
             else "  (쟁점이 추출되지 않았습니다. 토론 전반을 평가하십시오.)"
         )
-        system = _PROMPT.format(topic=topic, issues=issue_text)
+        system = _PROMPT.format(topic=topic, issues=issue_text,
+                                reasoning_chars=REASONING_CHARS)
         messages = [Message("system", system), Message("user", body)]
         sent = f"{system}\n\n{body}"
 
-        raw, resp = "", None
+        budget = self._max_tokens or required_output_tokens(len(issues), len(labels))
+        raw, resp, truncated = "", None, False
+
         for attempt in (1, 2):
             resp = await self._provider.chat(ChatRequest(
                 model=self._model, messages=tuple(messages),
-                temperature=0.1, max_tokens=self._max_tokens,
+                temperature=0.1, max_tokens=budget,
                 timeout_s=self._timeout_s, purpose="judge",
             ))
             raw = resp.text
+            truncated = resp.finish_reason == "length"
             try:
                 verdict = _parse(raw, labels, issues)
                 return replace(
@@ -142,17 +185,29 @@ class Judge:
             except ValueError as e:
                 if attempt == 2:
                     break
-                # 복구 1회: 무엇이 틀렸는지 붙여 다시 물어봅니다.
-                messages += [
-                    Message("assistant", raw[:2000]),
-                    Message("user", f"위 출력이 파싱되지 않았습니다: {e}\n"
-                                    f"설명 없이 올바른 JSON 만 다시 출력하십시오."),
-                ]
+                if truncated:
+                    # 같은 예산으로 다시 부르면 같은 자리에서 또 잘립니다.
+                    # 예산을 늘리면서 동시에 더 짧게 쓰라고 지시합니다 —
+                    # 예산만 올리면 장황한 모델은 늘어난 만큼 더 씁니다.
+                    budget = min(budget * 2, 32768)
+                    messages += [Message("user", (
+                        "직전 출력이 길이 제한에 걸려 중간에 끊겼습니다. "
+                        "각 reasoning 을 **한 문장**으로, conclusion 과 dissent 도 "
+                        "각각 한 문장으로 줄여서 JSON 전체를 완결해 주십시오. "
+                        "설명 없이 JSON 만 출력하십시오."))]
+                    # 잘린 본문은 다시 보내지 않습니다 — 예산만 먹고 도움이 안 됩니다.
+                else:
+                    messages += [
+                        Message("assistant", raw[:2000]),
+                        Message("user", f"위 출력이 파싱되지 않았습니다: {e}\n"
+                                        f"설명 없이 올바른 JSON 만 다시 출력하십시오."),
+                    ]
 
         # 두 번 실패해도 토론 기록은 살립니다. 판정만 unparsed 로 남깁니다.
         return Verdict(
             per_issue=(), rubric={}, winner=None, margin="tie",
-            conclusion="", dissent="", status="unparsed", raw=raw,
+            conclusion="", dissent="", status="unparsed",
+            failure_kind="truncated" if truncated else "malformed", raw=raw,
             judge_model=resp.model if resp else self._model,
             prompt_tokens=resp.usage.prompt_tokens if resp else 0,
             finish_reason=resp.finish_reason if resp else None,

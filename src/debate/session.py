@@ -226,7 +226,7 @@ class DebateSession:
                                   gate=self.gate, sink=self.emit)
             self.result = await engine.run(self.config)
 
-            if self.judge_spec and self.result.rounds:
+            if self.judge_spec and self._has_content():
                 await self._judge(anonymizer)
 
             self.status = "completed"
@@ -260,6 +260,12 @@ class DebateSession:
         }))
         await self._safe(self.pool.aclose())
 
+    def _has_content(self) -> bool:
+        """성공한 발언이 하나도 없으면 채점할 게 없습니다."""
+        return any(u.status == "ok"
+                   for r in (self.result.rounds if self.result else ())
+                   for u in r.utterances)
+
     async def _judge(self, anonymizer) -> None:
         """판정. 실패해도 토론 전체를 죽이지 않고 화면에 사유를 띄웁니다.
 
@@ -273,14 +279,36 @@ class DebateSession:
             for r in self.result.rounds for u in r.utterances if u.status == "ok"
         )
         judge = Judge(self.pool.get(self.judge_spec[0]), self.judge_spec[1],
+                      max_tokens=self.settings.judge_max_tokens or None,
                       timeout_s=self.settings.request_timeout_s)
+        # debate_completed 이후 판정까지 몇 분이 비면 화면이 멈춘 것과
+        # 구분되지 않습니다. 시작을 알리고 UI 가 경과 시간을 돌립니다.
+        await self.emit_raw({
+            "type": "judging_started",
+            "model": self.judge_spec[1],
+            "timeout_s": self.settings.judge_timeout_s,
+            "issues": len(self.result.issues),
+        })
         try:
             self.verdict = await asyncio.wait_for(
                 judge.evaluate(self.topic, self.result.issues, transcript,
                                labels=[s.label for s in self.specs]),
                 self.settings.judge_timeout_s,
             )
-            await self.emit_verdict()
+            if self.verdict is not None and self.verdict.status == "unparsed":
+                # 잘린 것과 형식이 깨진 것은 대처가 다릅니다. 하나로 묶어
+                # "파싱 실패"라고만 하면 예산 문제를 프롬프트 문제로 오해합니다.
+                kind = self.verdict.failure_kind
+                await self._verdict_failed(
+                    "심판 출력이 길이 제한에 걸려 중간에 잘렸습니다 "
+                    f"(finish_reason=length). DEBATE_JUDGE_MAX_TOKENS 를 올리거나 "
+                    "쟁점 수를 줄이십시오."
+                    if kind == "truncated" else
+                    "심판이 올바른 JSON 을 반환하지 않았습니다 (형식 오류). "
+                    "원문은 verdicts.raw 에 저장했습니다.",
+                    kind=kind)
+            else:
+                await self.emit_verdict()
         except asyncio.TimeoutError:
             await self._verdict_failed(
                 f"심판이 {self.settings.judge_timeout_s:.0f}초 안에 응답하지 "
@@ -288,9 +316,10 @@ class DebateSession:
         except Exception as e:                            # noqa: BLE001
             await self._verdict_failed(f"{type(e).__name__}: {e}")
 
-    async def _verdict_failed(self, reason: str) -> None:
+    async def _verdict_failed(self, reason: str, kind: str = "error") -> None:
         self.judge_error = reason
-        await self.emit_raw({"type": "verdict_failed", "message": reason})
+        await self.emit_raw({"type": "verdict_failed", "message": reason,
+                             "kind": kind})
 
     @staticmethod
     async def _safe(coro):
