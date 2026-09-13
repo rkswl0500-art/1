@@ -486,6 +486,7 @@ $('btn-create').onclick = async () => {
     $('m-est').innerHTML = `견적: 호출 <strong>${n(e.calls)}</strong>회 ·
       토큰 <strong>${n(e.tokens_low)}~${n(e.tokens_high)}</strong>
       · $${(+e.low_usd).toFixed(4)}~${(+e.high_usd).toFixed(4)}
+      ${e.judge_repair_tokens?`<br>판정 복구 시 +${n(e.judge_repair_tokens)} tok`:''}
       ${e.unpriced.length?'<br>가격 미상: '+e.unpriced.join(', '):''}`;
     $('setup-msg').textContent = `${debateId} 생성됨 · LLM 호출 ${j.llm_calls_made}회`;
     if(j.judge) $('setup-msg').textContent += ` · ${j.judge.note}`;

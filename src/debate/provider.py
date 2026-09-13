@@ -27,7 +27,9 @@ import httpx
 
 from .config import FAKE_PROVIDER, ProviderRegistry, ProviderSlot, Settings
 from .cost import CostMeter, estimate_tokens
-from .models import AgentSpec, ChatRequest, ChatResponse, ConfigError, Usage
+from .models import (
+    RUBRIC_KEYS, AgentSpec, ChatRequest, ChatResponse, ConfigError, Usage,
+)
 
 # ── 에러 ─────────────────────────────────────────────────────────────────────
 
@@ -270,7 +272,9 @@ def _fake_verdict(prompt_text: str) -> str:
              "reasoning": "측정 방법의 타당성에서 갈렸다."}
             for n, iid in enumerate(issues)
         ],
-        "rubric": {L: {k: score(i, n) for n, k in enumerate(("근거", "논리", "반박", "명료성"))}
+        # 축을 여기서 또 적지 않습니다. UI 표·CLI 출력·fake 판정 세 곳이 각자
+        # 하드코딩하고 있었고, '일관성' 을 추가했을 때 전부 어긋날 뻔했습니다.
+        "rubric": {L: {k: score(i, n) for n, k in enumerate(RUBRIC_KEYS)}
                    for i, L in enumerate(labels)},
         "winner": best,
         "margin": "narrow",

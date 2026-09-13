@@ -175,6 +175,7 @@ async def create(body: CreateDebate) -> dict:
             "low_usd": str(estimate.low_usd), "high_usd": str(estimate.high_usd),
             "unpriced": list(estimate.unpriced_models),
             "ko_tokens_per_char": estimate.ko_tokens_per_char,
+            "judge_repair_tokens": estimate.judge_repair_tokens,
         },
         "participants": [{"id": s.id, "label": s.label, "model": s.model,
                           "stance": s.stance, "persona": s.persona} for s in specs],

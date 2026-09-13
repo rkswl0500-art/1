@@ -245,7 +245,8 @@ def test_prompt_caps_reasoning_length():
     """쟁점당 2~3문장이면 충분하고, 길수록 잘릴 위험만 커집니다."""
     from debate.judge import REASONING_CHARS, _PROMPT
 
-    rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS)
+    rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS,
+                             rubric_example='"근거": 7')
     assert f"{REASONING_CHARS}자 이내" in rendered
     assert "JSON 을 반드시 닫으십시오" in rendered
     assert 80 <= REASONING_CHARS <= 200
@@ -262,7 +263,8 @@ def test_rubric_scores_self_consistency():
 
     assert "일관성" in RUBRIC_KEYS
 
-    rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS)
+    rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS,
+                             rubric_example='"근거": 7')
     assert "자기 입장을 유지했는가" in rendered
     assert "스스로 반박하거나 슬그머니 뒤집으면" in rendered
     # 설득당해 바꾼 것은 감점하지 않습니다 — 그건 토론이 작동한 것입니다
@@ -288,3 +290,34 @@ def test_budget_grows_with_the_number_of_rubric_axes():
     from debate.judge import RUBRIC_KEYS, required_output_tokens as need
 
     assert need(4, 2, thinking_reserve=0) > 15 * len(RUBRIC_KEYS) * 2
+
+
+def test_no_module_hardcodes_the_rubric_axes():
+    """UI 표·CLI 출력·fake 판정 세 곳이 각자 축 이름을 적고 있었습니다.
+    '일관성' 을 추가했을 때 전부 조용히 어긋날 뻔했습니다."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "debate"
+    literal = '"근거"'
+    offenders = [
+        f.name for f in src.rglob("*.py")
+        if f.name != "models.py" and literal in f.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], f"축을 하드코딩한 모듈: {offenders}"
+
+    html = (src / "static" / "index.html").read_text(encoding="utf-8")
+    assert "'근거','논리'" not in html      # 표는 판정 데이터에서 도출합니다
+
+
+async def test_fake_judge_covers_every_rubric_axis():
+    """fake 가 축을 빠뜨리면 0 으로 채워져 루브릭 검증이 무의미해집니다."""
+    from debate.models import RUBRIC_KEYS
+    from debate.provider import FakeProvider
+    from debate.models import ChatRequest, Message
+
+    resp = await FakeProvider().chat(ChatRequest(
+        model="m", messages=(Message("user", "참가자 A 참가자 B"),), purpose="judge"))
+    rubric = json.loads(resp.text)["rubric"]
+
+    for label, scores in rubric.items():
+        assert set(scores) == set(RUBRIC_KEYS), f"{label}: {sorted(scores)}"

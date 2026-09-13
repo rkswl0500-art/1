@@ -129,6 +129,13 @@ class CostEstimate:
     per_model: dict[str, tuple[Decimal, Decimal]]
     unpriced_models: tuple[str, ...]
     ko_tokens_per_char: float
+    #: 판정이 한 번 실패해 복구 호출이 붙었을 때 추가되는 몫.
+    #:
+    #: 본 범위에 섞지 않습니다. 섞으면 범위가 1.7배로 벌어져서 "보통 얼마"인지를
+    #: 잃습니다. 복구는 일어나거나 안 일어나거나이므로 따로 보여주는 편이
+    #: 판단에 쓰입니다. 실측: 복구 없는 실행 6,777 / 복구 1회 실행 9,239.
+    judge_repair_tokens: int = 0
+    judge_repair_usd: Decimal = Decimal(0)
 
     def format(self) -> str:
         lines = [
@@ -139,6 +146,11 @@ class CostEstimate:
         for model, (lo, hi) in sorted(self.per_model.items()):
             lines.append(f"  {model}: ${lo.quantize(Decimal('0.0001'))} ~ "
                          f"${hi.quantize(Decimal('0.0001'))}")
+        if self.judge_repair_tokens:
+            lines.append(
+                f"  판정 복구가 붙으면 +{self.judge_repair_tokens:,} tok "
+                f"(+${self.judge_repair_usd.quantize(Decimal('0.0001'))}) — "
+                f"심판 출력이 한 번에 파싱되지 않으면 1회 더 호출합니다")
         if self.unpriced_models:
             lines.append(f"  가격 미상: {', '.join(self.unpriced_models)} — 0 으로 계상")
         lines.append(f"  (한국어 토큰 계수 {self.ko_tokens_per_char}, "
@@ -226,10 +238,16 @@ class Estimator:
                 add(mod, self._tok(n * _OUT_CHARS_REBUTTAL[1] + _DIGEST_CHARS),
                     self._tok(150), self._tok(_DIGEST_CHARS))
 
+        repair_tokens, repair_usd = 0, Decimal(0)
         if judge_model:
             # Judge 는 전 라운드 전문을 한 번에 봅니다 — 단일 패스이므로.
+            before_hi, before_usd = tok_hi, sum(per_model_hi.values(), Decimal(0))
             add(judge_model, self._tok(sum(transcript_hi) + _ISSUES_CHARS),
                 self._tok(300), self._tok(1200))
+            # 복구 호출은 같은 프롬프트를 다시 보내는 것이라 한 번 더 친 것과
+            # 비슷합니다. 본 범위가 아니라 별도 항목으로 냅니다.
+            repair_tokens = tok_hi - before_hi
+            repair_usd = sum(per_model_hi.values(), Decimal(0)) - before_usd
 
         return CostEstimate(
             low_usd=sum(per_model_lo.values(), Decimal(0)),
@@ -238,4 +256,6 @@ class Estimator:
             per_model={m: (per_model_lo[m], per_model_hi[m]) for m in per_model_lo},
             unpriced_models=self._pricing.unpriced_models,
             ko_tokens_per_char=self._ko,
+            judge_repair_tokens=repair_tokens,
+            judge_repair_usd=repair_usd,
         )

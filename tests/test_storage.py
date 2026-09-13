@@ -311,3 +311,30 @@ def test_rebuttal_rounds_are_estimated_longer_than_the_opening():
 
     # 라운드가 하나 늘어난 몫이 R1 한 라운드보다 커야 합니다
     assert (two.tokens_high - one.tokens_high) > one.tokens_high
+
+
+def test_judge_repair_is_reported_apart_from_the_main_range():
+    """복구는 일어나거나 안 일어나거나입니다. 본 범위에 섞으면 폭이 1.7배로
+    벌어져 '보통 얼마'인지를 잃습니다 — 실측 6,777(복구 없음) 대 9,239(복구 1회)."""
+    e = _estimator().estimate(participants=_specs(2), rounds=2,
+                              judge_model="m", topic="주제")
+
+    assert e.judge_repair_tokens > 0
+    assert e.judge_repair_usd > 0
+    # 별도 항목이므로 본 범위에는 들어가 있지 않습니다
+    no_judge = _estimator().estimate(participants=_specs(2), rounds=2,
+                                     judge_model=None, topic="주제")
+    one_judge_share = e.tokens_high - no_judge.tokens_high
+    assert e.judge_repair_tokens == one_judge_share
+
+
+def test_estimate_without_a_judge_has_no_repair_allowance():
+    e = _estimator().estimate(participants=_specs(2), rounds=2,
+                              judge_model=None, topic="주제")
+    assert e.judge_repair_tokens == 0
+
+
+def test_repair_allowance_is_shown_in_the_formatted_output():
+    text = _estimator().estimate(participants=_specs(2), rounds=2,
+                                 judge_model="m", topic="주제").format()
+    assert "판정 복구가 붙으면" in text

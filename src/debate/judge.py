@@ -17,15 +17,8 @@ import re
 from dataclasses import dataclass, replace
 from typing import Literal, Mapping, Sequence
 
-from .models import AnonUtterance, ChatRequest, Issue, Message
+from .models import RUBRIC_KEYS, AnonUtterance, ChatRequest, Issue, Message
 
-#: 채점 축.
-#:
-#: '일관성' 은 나중에 추가했습니다. 4축(근거·논리·반박·명료성)만으로는 라운드마다
-#: 입장을 갈아타는 참가자를 못 잡습니다 — 실제로 R1 주장을 R2 에서 스스로
-#: 반박한 참가자들이 반박 9/8점을 받았습니다. 형식적으로는 반박 구조를
-#: 갖췄으니 맞는 점수인데, 토론으로는 성립하지 않습니다.
-RUBRIC_KEYS = ("근거", "논리", "반박", "명료성", "일관성")
 
 #: reasoning 한 건의 상한(문자). 쟁점당 2~3문장이면 충분하고, 길수록 잘릴
 #: 위험만 커집니다.
@@ -141,8 +134,7 @@ _PROMPT = """당신은 토론 심판입니다. 참가자가 아니며, 어느 �
 다른 말 없이 아래 JSON 만 출력하십시오.
 
 {{"per_issue": [{{"issue_id": "i1", "scores": {{"참가자 A": 7}}, "reasoning": "..."}}],
-  "rubric": {{"참가자 A": {{"근거": 7, "논리": 8, "반박": 6, "명료성": 7,
-                          "일관성": 9}}}},
+  "rubric": {{"참가자 A": {{{rubric_example}}}}},
   "winner": "참가자 A",
   "margin": "narrow",
   "conclusion": "...",
@@ -171,8 +163,13 @@ class Judge:
             "\n".join(f"  {i.id}) {i.title}" for i in issues) if issues
             else "  (쟁점이 추출되지 않았습니다. 토론 전반을 평가하십시오.)"
         )
+        # 예시 JSON 의 축도 상수에서 만듭니다. 손으로 적으면 축을 추가했을 때
+        # 프롬프트만 옛 축을 보여주고, 모델은 그걸 따릅니다.
+        rubric_example = ", ".join(f'"{k}": {7 + i % 3}'
+                                   for i, k in enumerate(RUBRIC_KEYS))
         system = _PROMPT.format(topic=topic, issues=issue_text,
-                                reasoning_chars=REASONING_CHARS)
+                                reasoning_chars=REASONING_CHARS,
+                                rubric_example=rubric_example)
         messages = [Message("system", system), Message("user", body)]
         sent = f"{system}\n\n{body}"
 
