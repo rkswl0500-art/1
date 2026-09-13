@@ -9,7 +9,7 @@ from decimal import Decimal
 from .config import PricingTable
 from typing import Sequence
 
-from .models import CallRecord, Usage
+from .models import CallRecord, Usage, build_header
 
 _HANGUL = (
     (0xAC00, 0xD7A3),  # 완성형 음절
@@ -146,14 +146,13 @@ class CostEstimate:
         return "\n".join(lines)
 
 
-#: 발언 1건의 출력 길이 가정.
+#: 발언 1건의 출력 길이 가정. 라운드 성격에 따라 다릅니다.
 #:
-#: 규칙은 600자 이내지만 모델은 그 상한까지 쓰지 않습니다. 라이브 실측에서
-#: 250~450자가 나와 그 범위로 좁혔습니다. 상한을 그대로 쓰면 견적이 실제의
-#: 3배까지 벌어집니다 — 범위가 넓은 건 정직한 게 아니라 쓸모없는 것입니다.
-_OUT_CHARS_LOW, _OUT_CHARS_HIGH = 250, 450
-#: 고정 헤더(주제 + 페르소나 + 규칙)의 대략적 크기.
-_HEADER_CHARS = 400
+#: R1 은 입론이라 짧고(실측 250~450자), R2 이후는 반박이라 구조가 더 붙습니다
+#: (인용 → 문제점 → 근거 + 입장 유지 설명). 하나의 넓은 범위로 뭉개면 정직한 게
+#: 아니라 쓸모없어집니다 — 규칙 상한은 600자입니다.
+_OUT_CHARS_R1 = (250, 450)
+_OUT_CHARS_REBUTTAL = (350, 600)
 #: 쟁점 목록과 요약본의 상한. 둘 다 길이가 묶여 있습니다.
 _ISSUES_CHARS, _DIGEST_CHARS = 300, 400
 
@@ -178,7 +177,7 @@ class Estimator:
 
     def estimate(
         self, *, participants: Sequence, rounds: int, judge_model: str | None,
-        moderator_model: str | None = None,
+        moderator_model: str | None = None, topic: str = "",
     ) -> CostEstimate:
         n = len(participants)
         per_model_lo: dict[str, Decimal] = {}
@@ -198,23 +197,33 @@ class Estimator:
         transcript_lo: list[int] = []   # 라운드별 발언 총량(저 추정), Judge 용
         transcript_hi: list[int] = []
 
+        # 헤더는 참가자마다 실제로 만들어 잽니다. 입장·페르소나를 넣으면 길어지고,
+        # 고정값으로 두면 그 차이를 영영 반영하지 못합니다.
+        header_chars = {
+            spec.model: len(build_header(spec, topic)) for spec in participants
+        }
+
         for round_no in range(1, rounds + 1):
+            rebuttal = round_no > 1
+            out_lo, out_hi = _OUT_CHARS_REBUTTAL if rebuttal else _OUT_CHARS_R1
             # 직전 라운드 전문은 (참가자 수 - 1) 명분이 들어갑니다.
-            prev_chars = 0 if round_no == 1 else (n - 1) * _OUT_CHARS_HIGH
-            extras = 0 if round_no == 1 else _ISSUES_CHARS + _DIGEST_CHARS
-            in_tok = self._tok(_HEADER_CHARS + prev_chars + extras)
+            prev_hi = _OUT_CHARS_R1[1] if round_no == 2 else _OUT_CHARS_REBUTTAL[1]
+            prev_chars = 0 if not rebuttal else (n - 1) * prev_hi
+            extras = 0 if not rebuttal else _ISSUES_CHARS + _DIGEST_CHARS
             for spec in participants:
-                add(spec.model, in_tok,
-                    self._tok(_OUT_CHARS_LOW), self._tok(_OUT_CHARS_HIGH))
-            transcript_lo.append(n * _OUT_CHARS_LOW)
-            transcript_hi.append(n * _OUT_CHARS_HIGH)
+                add(spec.model,
+                    self._tok(header_chars[spec.model] + prev_chars + extras),
+                    self._tok(out_lo), self._tok(out_hi))
+            transcript_lo.append(n * out_lo)
+            transcript_hi.append(n * out_hi)
 
         mod = moderator_model or (participants[0].model if participants else None)
         if mod and rounds >= 1:
             # 쟁점 추출 1회 + 요약 (rounds - 2) 회
-            add(mod, self._tok(n * _OUT_CHARS_HIGH), self._tok(100), self._tok(_ISSUES_CHARS))
+            add(mod, self._tok(n * _OUT_CHARS_R1[1]),
+                self._tok(100), self._tok(_ISSUES_CHARS))
             for _ in range(max(0, rounds - 2)):
-                add(mod, self._tok(n * _OUT_CHARS_HIGH + _DIGEST_CHARS),
+                add(mod, self._tok(n * _OUT_CHARS_REBUTTAL[1] + _DIGEST_CHARS),
                     self._tok(150), self._tok(_DIGEST_CHARS))
 
         if judge_model:

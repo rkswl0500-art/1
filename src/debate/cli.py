@@ -313,8 +313,12 @@ def _print_verdict(verdict) -> None:
         print(f"  [{score.issue_id}] {pairs}")
         if score.reasoning:
             print(f"        {score.reasoning}")
+    axes = sorted({k for scores in verdict.rubric.values() for k in scores})
+    for label in sorted(verdict.rubric):
+        row = verdict.rubric[label]
+        print(f"  {label}: " + "  ".join(f"{k} {row.get(k, '-')}" for k in axes))
     totals = verdict.totals()
-    print("  루브릭 합계: " + "  ".join(f"{k} {v}" for k, v in sorted(totals.items())))
+    print("  합계: " + "  ".join(f"{k} {v}" for k, v in sorted(totals.items())))
     winner = verdict.winner or "무승부"
     print(f"  승자: {winner} ({verdict.margin})")
     if verdict.conclusion:
@@ -454,7 +458,7 @@ async def _cmd_estimate(args: argparse.Namespace) -> int:
     estimate = Estimator(pricing, settings.ko_tokens_per_char).estimate(
         participants=specs, rounds=rounds,
         judge_model=judge[1] if judge else None,
-        moderator_model=args.moderator,
+        moderator_model=args.moderator, topic=topic,
     )
     print(f"주제: {topic}")
     print(f"참가자 {len(specs)}명 | 라운드 {rounds}"
@@ -528,7 +532,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     estimate = Estimator(pricing, settings.ko_tokens_per_char).estimate(
         participants=specs, rounds=rounds,
         judge_model=judge_spec[1] if judge_spec else None,
-        moderator_model=args.moderator,
+        moderator_model=args.moderator, topic=topic,
     )
     print(estimate.format())
 

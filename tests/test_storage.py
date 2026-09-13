@@ -283,3 +283,31 @@ def test_sse_stream_honours_last_event_id():
 
         ids3, _ = read()                           # 헤더 없으면 전체 재생
         assert ids3 == ids
+
+
+def test_estimate_uses_the_real_header_including_stance_and_persona():
+    """고정값으로 두면 입장·페르소나를 넣어 헤더가 길어져도 견적이 반영하지
+    못합니다. 효과 자체는 작지만(실측 +19자), 모르는 채로 두는 것과 다릅니다."""
+    from debate.models import AgentSpec
+
+    est = _estimator()
+    bare = [AgentSpec(f"p{i}", "L", "prov", "m", "토론자") for i in range(2)]
+    rich = [AgentSpec(f"p{i}", "L", "prov", "m",
+                      "데이터와 측정 방법을 중시하는 실증주의자" * 3, stance="찬성")
+            for i in range(2)]
+
+    assert (est.estimate(participants=rich, rounds=2, judge_model=None, topic="주제")
+            .tokens_low
+            > est.estimate(participants=bare, rounds=2, judge_model=None, topic="주제")
+            .tokens_low)
+
+
+def test_rebuttal_rounds_are_estimated_longer_than_the_opening():
+    """R1 은 입론이라 짧고, R2 이후는 반박 구조가 붙어 깁니다. 하나의 넓은
+    범위로 뭉개면 정직한 게 아니라 쓸모없어집니다."""
+    est = _estimator()
+    one = est.estimate(participants=_specs(2), rounds=1, judge_model=None, topic="t")
+    two = est.estimate(participants=_specs(2), rounds=2, judge_model=None, topic="t")
+
+    # 라운드가 하나 늘어난 몫이 R1 한 라운드보다 커야 합니다
+    assert (two.tokens_high - one.tokens_high) > one.tokens_high

@@ -100,7 +100,9 @@ async def test_scores_are_clamped_to_the_rubric_range():
         "winner": None, "margin": "tie", "conclusion": "", "dissent": "",
     }, ensure_ascii=False)
     v, _ = await _judge(wild)
-    assert v.rubric["참가자 A"] == {"근거": 10, "논리": 0, "반박": 0, "명료성": 7}
+    # 빠진 축(일관성)은 0 으로 채워집니다 — 키가 없다고 터지면 안 됩니다.
+    assert v.rubric["참가자 A"] == {"근거": 10, "논리": 0, "반박": 0,
+                                  "명료성": 7, "일관성": 0}
 
 
 # ── 편향 대응 ────────────────────────────────────────────────────────────────
@@ -247,3 +249,42 @@ def test_prompt_caps_reasoning_length():
     assert f"{REASONING_CHARS}자 이내" in rendered
     assert "JSON 을 반드시 닫으십시오" in rendered
     assert 80 <= REASONING_CHARS <= 200
+
+
+# ── 일관성 축 (2회차 라이브에서 드러남) ─────────────────────────────────────
+
+
+def test_rubric_scores_self_consistency():
+    """4축만으로는 라운드마다 입장을 갈아타는 참가자를 못 잡습니다. 실제로
+    R1 주장을 R2 에서 스스로 반박한 참가자들이 반박 9/8점을 받았습니다 —
+    형식적으로는 반박 구조를 갖췄으니 그 점수가 맞고, 그래서 축이 더 필요합니다."""
+    from debate.judge import RUBRIC_KEYS, REASONING_CHARS, _PROMPT
+
+    assert "일관성" in RUBRIC_KEYS
+
+    rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS)
+    assert "자기 입장을 유지했는가" in rendered
+    assert "스스로 반박하거나 슬그머니 뒤집으면" in rendered
+    # 설득당해 바꾼 것은 감점하지 않습니다 — 그건 토론이 작동한 것입니다
+    assert "무엇이 자신을 설득했는지 밝히고" in rendered
+
+
+async def test_consistency_score_is_parsed_and_totalled():
+    good = json.dumps({
+        "per_issue": [],
+        "rubric": {"참가자 A": {"근거": 7, "논리": 7, "반박": 9, "명료성": 7, "일관성": 2},
+                   "참가자 B": {"근거": 6, "논리": 6, "반박": 8, "명료성": 6, "일관성": 3}},
+        "winner": "참가자 B", "margin": "narrow", "conclusion": "c", "dissent": "d",
+    }, ensure_ascii=False)
+    v, _ = await _judge(good)
+
+    assert v.rubric["참가자 A"]["일관성"] == 2
+    assert v.totals() == {"참가자 A": 32, "참가자 B": 29}
+
+
+def test_budget_grows_with_the_number_of_rubric_axes():
+    """축을 늘리면 판정 JSON 도 길어집니다. 상수로 박아두면 축 추가가
+    조용히 잘림을 부릅니다."""
+    from debate.judge import RUBRIC_KEYS, required_output_tokens as need
+
+    assert need(4, 2, thinking_reserve=0) > 15 * len(RUBRIC_KEYS) * 2

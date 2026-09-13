@@ -149,7 +149,7 @@ async def create(body: CreateDebate) -> dict:
 
     estimate = Estimator(pricing, settings.ko_tokens_per_char).estimate(
         participants=specs, rounds=body.rounds,
-        judge_model=judge_spec[1] if judge_spec else None)
+        judge_model=judge_spec[1] if judge_spec else None, topic=body.topic)
 
     from .models import DebateConfig
 

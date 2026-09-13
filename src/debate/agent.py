@@ -14,6 +14,7 @@ from typing import Sequence
 
 from .config import PricingTable
 from .models import (
+    DEBATE_RULES, build_header,  # 재수출: 기존 import 경로 유지
     AgentSpec, AnonUtterance, ChatRequest, ContextPack, Issue, Message,
     Usage, Utterance,
 )
@@ -66,26 +67,8 @@ def _make_fake(body: CreateDebate) -> FakeProvider:
     return FakeProvider({m: FakeBehavior(latency_ms=ms) for m, ms in lat.items()})
 
 
-DEBATE_RULES = """[규칙]
-- 한국어로 답하십시오.
-- 근거를 먼저 제시하고 주장을 뒤에 두십시오.
-- 상대를 인신공격하지 말고 주장만 다투십시오.
-- 600자 이내로 쓰십시오.
-- 당신이 어떤 모델인지, 어느 회사가 만들었는지 절대 언급하지 마십시오.
-  자기소개, 서명, "AI로서" 같은 표현도 쓰지 마십시오."""
 
 
-def build_header(spec: AgentSpec, topic: str) -> str:
-    """참가자별 고정 헤더. 라운드가 바뀌어도 이 부분은 안 바뀝니다."""
-    lines = [
-        f"당신은 토론 참가자 «{spec.label}» 입니다.",
-        f"[주제] {topic}",
-        f"[당신의 역할] {spec.persona}",
-    ]
-    if spec.stance:
-        lines.append(f"[당신의 입장] {spec.stance}")
-    lines.append(DEBATE_RULES)
-    return "\n\n".join(lines)
 
 
 class Agent:

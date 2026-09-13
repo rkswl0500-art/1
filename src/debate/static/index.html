@@ -136,6 +136,7 @@ fake/fake-c | 중립 | 비용과 트레이드오프를 따지는 회의주의자
       <button class="chip" data-fill="삼자">찬성/반대/중립 3명</button>
       <button class="chip" data-fill="무입장">입장 없이</button>
     </div>
+    <div class="note" id="stance-hint" style="margin-top:6px"></div>
     <div class="row" style="margin-top:8px">
       <div style="flex:1;min-width:200px">
         <label>Judge (provider/model, 비우면 판정 없음)</label>
@@ -385,13 +386,16 @@ function showVerdict(v){
     return;
   }
   const labels = Object.keys(v.totals).sort();
+  // 축 이름을 하드코딩하지 않습니다 — 서버 루브릭이 바뀌면 표가 조용히
+  // 어긋납니다 (실제로 '일관성' 축을 추가했을 때 그럴 뻔했습니다).
+  const axes = [...new Set(labels.flatMap(L => Object.keys(v.rubric[L] || {})))];
   let h = `<table><tr><th>참가자</th>`+
-    ['근거','논리','반박','명료성'].map(k=>`<th class="num">${k}</th>`).join('')+
+    axes.map(k=>`<th class="num">${k}</th>`).join('')+
     `<th class="num">합계</th></tr>`;
   labels.forEach(L=>{
     const r = v.rubric[L]||{};
     h += `<tr><td class="${L===v.winner?'win':''}">${L}</td>`+
-      ['근거','논리','반박','명료성'].map(k=>`<td class="num">${r[k]??'-'}</td>`).join('')+
+      axes.map(k=>`<td class="num">${r[k]??'-'}</td>`).join('')+
       `<td class="num"><strong>${v.totals[L]}</strong></td></tr>`;
   });
   h += `</table><p style="margin:10px 0 4px"><strong>승자:</strong>
@@ -422,6 +426,21 @@ const PRESETS = {
          '중립 | 비용과 트레이드오프를 따지는 회의주의자'],
   무입장: null,
 };
+// 입장 미지정의 한계를 실측 그대로 알려줍니다. 경고가 아니라 안내입니다 —
+// 입장 없이 돌리는 것도 유효한 실험이고, 다만 무엇이 일어나는지는 알아야 합니다.
+const STANCE_HINT =
+  '입장을 지정하지 않으면 같은 모델끼리 <strong>같은 편으로 수렴</strong>하거나, ' +
+  '라운드마다 <strong>입장이 바뀔</strong> 수 있습니다. ' +
+  '실측에서 둘 다 관찰됐습니다 — R1 전원 찬성, R2 에서 서로 자기 R1 주장을 반박.';
+
+function refreshStanceHint(){
+  const lines = $('agents').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const missing = lines.filter(l => !(l.split('|')[1] || '').trim()).length;
+  $('stance-hint').innerHTML = missing
+    ? `입장 미지정 ${missing}명 · ${STANCE_HINT}` : '';
+}
+$('agents').addEventListener('input', refreshStanceHint);
+
 document.querySelectorAll('.chip').forEach(btn => btn.onclick = () => {
   const heads = $('agents').value.split('\n')
                   .map(s => s.split('|')[0].trim()).filter(Boolean);
@@ -429,11 +448,14 @@ document.querySelectorAll('.chip').forEach(btn => btn.onclick = () => {
   const tails = PRESETS[btn.dataset.fill];
   if(tails === null){                       // 입장만 지우고 참가자 수는 유지
     $('agents').value = heads.join('\n');
+    refreshStanceHint();
     return;
   }
   $('agents').value = tails.map((tail, i) =>
     `${heads[i] || heads[heads.length - 1]} | ${tail}`).join('\n');
+  refreshStanceHint();
 });
+refreshStanceHint();
 
 $('btn-create').onclick = async () => {
   $('setup-msg').textContent = '견적 계산 중…';

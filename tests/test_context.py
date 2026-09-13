@@ -241,3 +241,15 @@ def test_a_participants_stance_does_not_leak_to_others():
     assert "찬성" in header_a
     assert "반대" not in header_a
     assert b.model not in header_a
+
+
+def test_later_rounds_require_holding_the_round_one_position():
+    """입장을 지정하지 않으면 라운드마다 반대편으로 넘어갑니다. 실측에서 둘 다
+    자기 R1 주장을 R2 에서 반박했습니다 — 토론이 아니라 독백 교대입니다."""
+    text = _rendered(_builder().build_for(
+        SPECS[0], DebateState(topic="주제", round_no=2)))
+
+    assert "제1라운드에서 취한 입장을 유지하십시오" in text
+    # 변경 자체를 막지는 않습니다 — 막으면 억지로 버티게 됩니다
+    assert "무엇이 당신을 설득했는지 명시하고 바꾸십시오" in text
+    assert "형식만 갖추고 자기 주장을 뒤집는 것도 같습니다" in text

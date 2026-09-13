@@ -19,7 +19,13 @@ from typing import Literal, Mapping, Sequence
 
 from .models import AnonUtterance, ChatRequest, Issue, Message
 
-RUBRIC_KEYS = ("근거", "논리", "반박", "명료성")
+#: 채점 축.
+#:
+#: '일관성' 은 나중에 추가했습니다. 4축(근거·논리·반박·명료성)만으로는 라운드마다
+#: 입장을 갈아타는 참가자를 못 잡습니다 — 실제로 R1 주장을 R2 에서 스스로
+#: 반박한 참가자들이 반박 9/8점을 받았습니다. 형식적으로는 반박 구조를
+#: 갖췄으니 맞는 점수인데, 토론으로는 성립하지 않습니다.
+RUBRIC_KEYS = ("근거", "논리", "반박", "명료성", "일관성")
 
 #: reasoning 한 건의 상한(문자). 쟁점당 2~3문장이면 충분하고, 길수록 잘릴
 #: 위험만 커집니다.
@@ -45,7 +51,7 @@ def required_output_tokens(
     content = (
         300                                              # JSON 뼈대 + margin/winner
         + issue_count * (80 + 20 * participant_count)    # per_issue: 점수 + reasoning
-        + participant_count * 60                         # rubric 4항목
+        + participant_count * 15 * len(RUBRIC_KEYS)      # rubric 각 축
         + 300                                            # conclusion + dissent
     )
     return min(cap, thinking_reserve + int(content * 1.5))
@@ -114,6 +120,12 @@ _PROMPT = """당신은 토론 심판입니다. 참가자가 아니며, 어느 �
 - 논리: 전제에서 결론까지의 연결이 타당한가
 - 반박: 상대의 논점에 실제로 답했는가 (회피·화제전환은 감점)
 - 명료성: 주장이 검증 가능한 형태로 진술되었는가
+- 일관성: 라운드를 거치며 자기 입장을 유지했는가.
+  * 제1라운드 주장을 이후 라운드에서 **스스로 반박하거나 슬그머니 뒤집으면**
+    크게 감점하십시오. 상대를 반박하는 형식만 갖추고 실제로는 자기 입장을
+    갈아탄 경우가 여기 해당합니다.
+  * 다만 **무엇이 자신을 설득했는지 밝히고** 입장을 바꾼 것은 감점하지
+    마십시오. 그건 토론이 작동한 것입니다.
 
 [지침]
 - 발언 순서는 무작위입니다. 먼저 나온 쪽을 우대하지 마십시오.
@@ -129,7 +141,8 @@ _PROMPT = """당신은 토론 심판입니다. 참가자가 아니며, 어느 �
 다른 말 없이 아래 JSON 만 출력하십시오.
 
 {{"per_issue": [{{"issue_id": "i1", "scores": {{"참가자 A": 7}}, "reasoning": "..."}}],
-  "rubric": {{"참가자 A": {{"근거": 7, "논리": 8, "반박": 6, "명료성": 7}}}},
+  "rubric": {{"참가자 A": {{"근거": 7, "논리": 8, "반박": 6, "명료성": 7,
+                          "일관성": 9}}}},
   "winner": "참가자 A",
   "margin": "narrow",
   "conclusion": "...",
