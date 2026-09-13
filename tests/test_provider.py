@@ -317,3 +317,36 @@ async def test_dump_hook_receives_raw_body_and_never_headers():
 
     assert captured and captured[0]["choices"][0]["message"]["content"] == "답"
     assert "sk-topsecret" not in json.dumps(captured)
+
+
+# ── provider/model 파싱 (모델 ID 에 / 가 들어감) ────────────────────────────
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("gemini/gemini-3-flash-preview", ("gemini", "gemini-3-flash-preview")),
+    ("gemini/models/gemini-3.6-flash", ("gemini", "models/gemini-3.6-flash")),
+    ("openai/gpt-4o-mini", ("openai", "gpt-4o-mini")),
+    ("bare-model", ("기본", "bare-model")),
+    ("  gemini/x  ", ("gemini", "x")),
+])
+def test_split_provider_model_uses_the_first_slash(raw, expected):
+    """마지막 / 로 자르면 provider 가 'gemini/models' 가 되어 못 찾습니다."""
+    from debate.agent import split_provider_model
+
+    assert split_provider_model(raw, "기본") == expected
+
+
+def test_pricing_matches_with_or_without_the_models_prefix():
+    """같은 모델이 요청과 응답에서 접두사가 다르게 옵니다. 그 때문에 '가격 미상'
+    경고가 뜨면 경고가 신호 구실을 못 합니다."""
+    from debate.config import ModelPrice, PricingTable
+
+    prefixed = PricingTable({"models/gemini-3.6-flash": ModelPrice(Decimal(1), Decimal(2))})
+    assert prefixed.cost_for("models/gemini-3.6-flash", Usage(1_000_000, 0))[1] is True
+    assert prefixed.cost_for("gemini-3.6-flash", Usage(1_000_000, 0))[1] is True
+
+    bare = PricingTable({"gemini-3.6-flash": ModelPrice(Decimal(1), Decimal(2))})
+    assert bare.cost_for("models/gemini-3.6-flash", Usage(1_000_000, 0))[1] is True
+    assert bare.cost_for("gemini-3.6-flash", Usage(1_000_000, 0))[1] is True
+
+    assert bare.cost_for("완전히-다른-모델", Usage(1_000_000, 0))[1] is False

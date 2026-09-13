@@ -35,6 +35,9 @@ from .storage import SqliteStore
 #: 토론을 붙잡아 두기에는 짧습니다. 0 이면 대기 자체를 하지 않습니다.
 DEFAULT_GATE_TIMEOUT_S = 120.0
 
+#: _safe() 가 실패를 알리는 표식.
+_FAILED = object()
+
 
 def event_to_dict(event: Any) -> dict:
     """엔진 이벤트를 SSE 로 보낼 수 있는 형태로."""
@@ -162,6 +165,8 @@ class DebateSession:
     error: str | None = None
     started_at: float | None = None
     finished_at: float | None = None
+    #: 판정 실패 사유. 토론은 성공했는데 심판만 실패한 경우를 구분합니다.
+    judge_error: str | None = None
 
     # ── 이벤트 팬아웃 ────────────────────────────────────────────────────
     async def emit(self, event: Any) -> None:
@@ -222,28 +227,78 @@ class DebateSession:
             self.result = await engine.run(self.config)
 
             if self.judge_spec and self.result.rounds:
-                transcript = tuple(
-                    anonymizer.to_anon(u)
-                    for r in self.result.rounds for u in r.utterances
-                    if u.status == "ok"
-                )
-                judge = Judge(self.pool.get(self.judge_spec[0]), self.judge_spec[1],
-                              timeout_s=self.settings.request_timeout_s)
-                self.verdict = await judge.evaluate(
-                    self.topic, self.result.issues, transcript,
-                    labels=[s.label for s in self.specs])
-                await self.emit_verdict()
+                await self._judge(anonymizer)
 
             self.status = "completed"
         except Exception as e:                            # noqa: BLE001
             self.status, self.error = "failed", f"{type(e).__name__}: {e}"
-            await self.emit_raw({"type": "error", "message": self.error})
+            await self._safe(self.emit_raw({"type": "error", "message": self.error}))
         finally:
-            self.finished_at = time.perf_counter()
-            await self._persist()
-            await self.emit_raw({"type": "finished", "status": self.status,
-                                 "waited_s": round(self.gate.total_waited_s, 1)})
-            await self.pool.aclose()
+            await self.finalize()
+
+    async def finalize(self) -> None:
+        """종료 절차. **어떤 단계가 실패해도 finished 는 반드시 나갑니다.**
+
+        스트림이 안 닫히면 EventSource 가 영원히 재연결하고, 사용자는 토론이
+        멈춘 건지 끝난 건지 알 수 없습니다. 그래서 각 단계를 따로 감쌉니다.
+        """
+        self.finished_at = time.perf_counter()
+        if await self._safe(self._persist()) is _FAILED:
+            await self._safe(self.emit_raw({
+                "type": "storage_failed",
+                "message": "기록 저장에 실패했습니다. 토론 결과는 화면에만 있습니다.",
+            }))
+        await self._safe(self.emit_raw({
+            "type": "finished",
+            # 토론의 실제 결과를 씁니다. self.status 는 "run() 이 예외 없이
+            # 끝났다"는 뜻이라, 참가자가 전원 죽어 중단된 토론도 completed 로
+            # 보입니다 — 화면에 그대로 나가면 거짓말이 됩니다.
+            "status": self.result.status if self.result else self.status,
+            "run_status": self.status,
+            "judge_error": self.judge_error,
+            "waited_s": round(self.gate.total_waited_s, 1),
+        }))
+        await self._safe(self.pool.aclose())
+
+    async def _judge(self, anonymizer) -> None:
+        """판정. 실패해도 토론 전체를 죽이지 않고 화면에 사유를 띄웁니다.
+
+        전체 시한을 따로 겁니다. 재시도 예산(retry_attempts × request_timeout_s)이
+        기본값에서 6분이라, 심판이 무응답이면 그 6분 동안 아무 이벤트도 안 나가고
+        화면이 멈춘 것처럼 보입니다.
+        """
+        assert self.result is not None and self.judge_spec is not None
+        transcript = tuple(
+            anonymizer.to_anon(u)
+            for r in self.result.rounds for u in r.utterances if u.status == "ok"
+        )
+        judge = Judge(self.pool.get(self.judge_spec[0]), self.judge_spec[1],
+                      timeout_s=self.settings.request_timeout_s)
+        try:
+            self.verdict = await asyncio.wait_for(
+                judge.evaluate(self.topic, self.result.issues, transcript,
+                               labels=[s.label for s in self.specs]),
+                self.settings.judge_timeout_s,
+            )
+            await self.emit_verdict()
+        except asyncio.TimeoutError:
+            await self._verdict_failed(
+                f"심판이 {self.settings.judge_timeout_s:.0f}초 안에 응답하지 "
+                "않았습니다 (DEBATE_JUDGE_TIMEOUT_S)")
+        except Exception as e:                            # noqa: BLE001
+            await self._verdict_failed(f"{type(e).__name__}: {e}")
+
+    async def _verdict_failed(self, reason: str) -> None:
+        self.judge_error = reason
+        await self.emit_raw({"type": "verdict_failed", "message": reason})
+
+    @staticmethod
+    async def _safe(coro):
+        """한 단계의 실패가 종료 절차 전체를 막지 못하게 합니다."""
+        try:
+            return await coro
+        except Exception:                                 # noqa: BLE001
+            return _FAILED
 
     async def emit_raw(self, payload: dict) -> None:
         payload["seq"] = len(self.events)

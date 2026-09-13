@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from .agent import Agent, Anonymizer, Moderator
+from .agent import Agent, Anonymizer, Moderator, split_provider_model
 from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
 from .cost import CostMeter, Estimator
 from .context import ContextBuilder
@@ -266,9 +266,7 @@ def _resolve_judge(args, specs: list[AgentSpec], settings) -> tuple[str, str] | 
     """
     if not args.judge:
         return None
-    provider, _, model = args.judge.rpartition("/")
-    if not provider:
-        provider = specs[0].provider
+    provider, model = split_provider_model(args.judge, specs[0].provider)
     if not model:
         raise ConfigError(f"--judge {args.judge!r}: 'provider/model' 형식으로 쓰세요")
 

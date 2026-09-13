@@ -86,6 +86,7 @@ th{font-size:11px;color:var(--muted);font-weight:600}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
 .win{color:var(--ok);font-weight:700}
 .note{font-size:12px;color:var(--muted);margin-top:8px}
+.fail{color:var(--bad);font-weight:700}
 #log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;
   color:var(--muted);max-height:150px;overflow:auto;white-space:pre-wrap}
 </style>
@@ -284,12 +285,33 @@ function handle(ev){
       $('status-line').textContent = `제${ev.round_no}라운드 시작 전 — 지시 대기 중`;
       openGate(ev.round_no, ev.timeout_s); break;
     case 'verdict': showVerdict(ev); break;
+    case 'verdict_failed':
+      $('verdict-panel').style.display='block';
+      $('verdict').innerHTML =
+        `<div class="fail">판정을 받지 못했습니다.</div>
+         <div class="note">${ev.message}</div>
+         <div class="note">토론 내용과 기록은 그대로 남아 있습니다.</div>`;
+      break;
+    case 'storage_failed':
+      $('status-line').textContent += ' · 저장 실패';
+      log('저장 실패: '+ev.message);
+      break;
     case 'finished':
       // 닫지 않으면 EventSource 가 3초마다 다시 붙고 서버가 버퍼를 다시
       // 재생해서 화면이 무한히 중복됩니다.
       closeStream();
       closeGate();
-      $('status-line').textContent = `종료 — ${ev.status} (사람 대기 ${ev.waited_s}초)`;
+      {
+        const label = {
+          completed: '완료',
+          aborted_insufficient_participants: '중단 — 생존 참가자 부족',
+          failed: '실패',
+        }[ev.status] || ev.status;
+        let line = `종료 — ${label} (사람 대기 ${ev.waited_s}초)`;
+        if(ev.judge_error) line += ' · 판정 실패';
+        $('status-line').textContent = line;
+      }
+      $('conn').textContent = '완료 — 연결 종료';
       Object.keys(timers).forEach(stopTimer);
       break;
     case 'error': $('status-line').textContent = '오류: '+ev.message; break;

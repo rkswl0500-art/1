@@ -61,7 +61,12 @@ class Settings(BaseSettings):
     retry_attempts: int = 3
     pricing_path: Path = Path("config/pricing.yaml")
     db_path: Path = Path("data/debates.db")
-    ko_tokens_per_char: float = 1.0
+    #: 한국어 토큰 추정 계수.
+    #:
+    #: 2026-09 Gemini 라이브 실측으로 보정했습니다: 172~319 토큰 / 250~450자
+    #: → 0.69~0.71. 처음 1.0 은 보수적 추측이었고 약 1.4배 과대였습니다.
+    #: 모델(토크나이저)마다 달라지므로 다른 벤더를 붙이면 다시 재야 합니다.
+    ko_tokens_per_char: float = 0.7
     #: 발언 1건의 출력 토큰 상한.
     #:
     #: 한국어는 600자만 해도 토크나이저에 따라 600~900 토큰입니다. 여기에
@@ -83,6 +88,12 @@ class Settings(BaseSettings):
     #: 하나가 최대 이만큼 라운드를 붙잡을 수 있으므로, 그동안 누구를 기다리는지는
     #: 진행 표시로 보입니다.
     round_timeout_s: float = 400.0
+    #: 판정 1건의 전체 시한(재시도 포함).
+    #:
+    #: 재시도 예산은 기본값에서 6분인데, 심판이 무응답이면 그 동안 화면에
+    #: 아무 이벤트도 안 나가 멈춘 것처럼 보입니다. 판정은 단일 호출이라
+    #: 토론만큼 오래 걸릴 이유가 없어 더 짧게 끊습니다.
+    judge_timeout_s: float = 180.0
 
     @property
     def retry_budget_s(self) -> float:
@@ -256,9 +267,25 @@ class PricingTable:
             )
         return cls(out)
 
+    def _lookup(self, model: str) -> "ModelPrice | None":
+        """접두사 유무를 가리지 않고 찾습니다.
+
+        같은 모델이 요청에서는 `models/gemini-3.6-flash`, 응답에서는
+        `gemini-3.6-flash` 로 오는 경우가 있습니다. 가격표를 어느 쪽으로 적든
+        맞도록 양쪽을 다 시도합니다 — 접두사 하나 때문에 "가격 미상" 경고가
+        뜨면 그 경고는 신호 구실을 못 합니다.
+        """
+        price = self._prices.get(model)
+        if price is not None:
+            return price
+        bare = model.rsplit("/", 1)[-1]
+        if bare != model and (price := self._prices.get(bare)) is not None:
+            return price
+        return self._prices.get(f"models/{model}")
+
     def cost_for(self, model: str, usage: Usage) -> tuple[Decimal, bool]:
         """(비용, 가격을 알고 있었는가) 를 돌려줍니다."""
-        price = self._prices.get(model)
+        price = self._lookup(model)
         if price is None:
             self._unpriced.add(model)
             return Decimal(0), False

@@ -195,3 +195,116 @@ def test_every_emitted_event_carries_a_monotonic_seq():
 
     asyncio.run(run())
     assert [e["seq"] for e in s.events] == [0, 1, 2, 3, 4]
+
+
+# ── 종료 이벤트는 어떤 실패에도 나가야 한다 (라이브에서 드러남) ─────────────
+
+
+def _runnable_session(**kw):
+    """run() 의 종료 절차만 떼어 검사하기 위한 최소 세션."""
+    from debate.config import PricingTable, Settings
+    from debate.cost import CostMeter
+    from debate.session import DebateSession
+
+    s = DebateSession.__new__(DebateSession)
+    s.events, s.subscribers = [], set()
+    s.meter = CostMeter(PricingTable({}), "d")
+    s.settings = Settings(_env_file=None)
+    s.gate = HttpGate(0.0, _emit_nothing)
+    s.status, s.error, s.judge_error = "running", None, None
+    s.result = s.verdict = s.judge_spec = None
+    s.pool = type("P", (), {"aclose": staticmethod(lambda: asyncio.sleep(0))})()
+    for k, v in kw.items():
+        setattr(s, k, v)
+    return s
+
+
+async def _finish_like_run(session, persist):
+    """실제 종료 절차를 호출합니다. 테스트가 finally 블록을 베껴 쓰면 코드가
+    바뀌었을 때 테스트만 통과하는 상태가 됩니다."""
+    session._persist = persist
+    await session.finalize()
+
+
+async def test_finished_is_emitted_even_when_storage_fails():
+    """저장이 터지면 finished 가 통째로 사라져 스트림이 영원히 안 닫혔습니다.
+    EventSource 는 그걸 끊김으로 보고 계속 재연결합니다."""
+    session = _runnable_session()
+
+    async def boom():
+        raise OSError("disk full")
+
+    await _finish_like_run(session, boom)
+    types = [e["type"] for e in session.events]
+
+    assert "storage_failed" in types      # 조용히 넘어가지 않음
+    assert types[-1] == "finished"        # 그래도 스트림은 닫힘
+
+
+async def test_finished_is_emitted_after_a_clean_save():
+    session = _runnable_session()
+
+    async def fine():
+        return None
+
+    await _finish_like_run(session, fine)
+    assert [e["type"] for e in session.events] == ["finished"]
+
+
+async def test_safe_swallows_only_the_failing_stage():
+    from debate.session import _FAILED
+
+    session = _runnable_session()
+
+    async def boom():
+        raise RuntimeError("x")
+
+    async def ok():
+        return "값"
+
+    assert await session._safe(boom()) is _FAILED
+    assert await session._safe(ok()) == "값"
+
+
+async def test_judge_failure_is_reported_not_swallowed():
+    """판정 실패는 화면에 사유가 떠야 합니다. 토론 자체는 살아 있습니다."""
+    session = _runnable_session()
+    await session._verdict_failed("RetryableError: 3회 시도 모두 실패")
+
+    assert session.judge_error is not None
+    assert session.events[-1]["type"] == "verdict_failed"
+    assert "3회 시도" in session.events[-1]["message"]
+
+
+def test_judge_has_its_own_deadline_shorter_than_the_retry_budget():
+    """재시도 예산이 기본 6분이라, 심판 무응답 시 그동안 이벤트가 안 나갑니다."""
+    from debate.config import Settings
+
+    s = Settings(_env_file=None)
+    assert s.judge_timeout_s < s.retry_budget_s
+    assert 60 <= s.judge_timeout_s <= 300
+
+
+async def test_finished_reports_the_debate_outcome_not_just_that_run_returned():
+    """세션 status 는 'run() 이 예외 없이 끝났다'는 뜻입니다. 참가자가 전원 죽어
+    중단된 토론도 그 값으로는 completed 로 보입니다."""
+    from debate.models import AgentSpec, DebateResult
+
+    session = _runnable_session()
+    session.status = "completed"
+    session.result = DebateResult(
+        debate_id="d", topic="t",
+        participants=(AgentSpec("p1", "참가자 A", "fake", "m", "x"),),
+        rounds=(), status="aborted_insufficient_participants")
+    session.judge_error = "RetryableError: 심판 무응답"
+
+    async def fine():
+        return None
+
+    await _finish_like_run(session, fine)
+    last = session.events[-1]
+
+    assert last["type"] == "finished"
+    assert last["status"] == "aborted_insufficient_participants"
+    assert last["run_status"] == "completed"      # 둘을 구분해서 싣습니다
+    assert last["judge_error"] == "RetryableError: 심판 무응답"

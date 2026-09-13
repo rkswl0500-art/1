@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .agent import DEFAULT_PERSONA_FALLBACK
+from .agent import DEFAULT_PERSONA_FALLBACK, split_provider_model
 from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
 from .cost import CostMeter, Estimator
 from .judge import family_note, vendor_family
@@ -121,8 +121,7 @@ async def create(body: CreateDebate) -> dict:
 
     judge_spec = None
     if body.judge:
-        provider, _, model = body.judge.rpartition("/")
-        provider = provider or specs[0].provider
+        provider, model = split_provider_model(body.judge, specs[0].provider)
         if not model:
             raise HTTPException(400, "judge 는 'provider/model' 형식이어야 합니다")
         if any(s.model == model for s in specs) and not body.allow_judge_overlap:

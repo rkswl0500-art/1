@@ -23,6 +23,26 @@ from .provider import ChatProvider, ProviderError
 #: (2차는 슬라이스 2 의 Anonymizer.scrub). 문체 기반 추정까지는 못 막습니다.
 DEFAULT_PERSONA_FALLBACK = "논리적 근거를 중시하는 토론자"
 
+
+def split_provider_model(raw: str, default_provider: str) -> tuple[str, str]:
+    """'provider/model' 을 **첫 번째 /** 기준으로 나눕니다.
+
+    모델 ID 자체에 / 가 들어갑니다(예: models/gemini-3.6-flash). 마지막 / 로
+    자르면 provider 가 'gemini/models' 가 되어 프로바이더를 못 찾습니다.
+    / 가 아예 없으면 전체를 모델로 보고 프로바이더는 기본값을 씁니다.
+    """
+    head, sep, tail = raw.strip().partition("/")
+    if not sep:
+        return default_provider, head
+    return (head or default_provider), tail
+
+def _make_fake(body: CreateDebate) -> FakeProvider:
+    from .provider import FakeBehavior
+
+    lat = body.fake_latency_ms or {}
+    return FakeProvider({m: FakeBehavior(latency_ms=ms) for m, ms in lat.items()})
+
+
 DEBATE_RULES = """[규칙]
 - 한국어로 답하십시오.
 - 근거를 먼저 제시하고 주장을 뒤에 두십시오.
