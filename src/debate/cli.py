@@ -28,7 +28,7 @@ from .config import (
 from .cost import CostMeter, Estimator
 from .context import ContextBuilder
 from .engine import DebateEngine
-from .judge import Judge, family_note
+from .judge import Judge, family_note, score_contradictions
 from .session import new_debate_id
 from .storage import SqliteStore
 from .models import (
@@ -332,6 +332,9 @@ def _print_verdict(verdict) -> None:
     if verdict.truncated:
         print("  ⚠ 판정이 잘렸습니다(finish_reason=length). "
               "단일 패스 한계에 도달했을 수 있습니다.")
+    for note in score_contradictions(verdict):
+        # 점수 필드는 정확합니다. 산문만 틀렸으므로 표를 믿으라고 알려줍니다.
+        print(f"  ⚠ {note}\n     위 표의 점수가 정확합니다.")
 
 
 def _print_result(result: DebateResult, meter: CostMeter) -> None:

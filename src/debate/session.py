@@ -22,7 +22,7 @@ from .config import PricingTable, Settings
 from .context import ContextBuilder
 from .cost import CostEstimate, CostMeter, Estimator
 from .engine import DebateEngine
-from .judge import Judge, Verdict, family_note
+from .judge import Judge, Verdict, family_note, score_contradictions
 from .models import (
     AgentDropped, AgentSpec, DebateCompleted, DebateConfig, DebateResult,
     DebateStarted, DebateState, Directive, IssuesExtracted, RoundCompleted,
@@ -348,6 +348,9 @@ class DebateSession:
             "per_issue": [{"issue_id": s.issue_id, "scores": dict(s.scores),
                            "reasoning": s.reasoning} for s in v.per_issue],
             "truncated": v.truncated, "prompt_tokens": v.prompt_tokens,
+            # 산문의 점수가 표와 어긋나는 경우. 판정 자체는 유효하므로 실패로
+            # 다루지 않고 표시만 합니다.
+            "score_contradictions": list(score_contradictions(v)),
         })
 
     async def _persist(self) -> None:

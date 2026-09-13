@@ -531,6 +531,10 @@ function showVerdict(v){
     <span class="win">${v.winner||'무승부'}</span> <span class="badge">${v.margin}</span></p>`;
   if(v.conclusion) h += `<p style="margin:4px 0"><strong>결론:</strong> ${v.conclusion}</p>`;
   if(v.dissent) h += `<p style="margin:4px 0"><strong>미해결 반론:</strong> ${v.dissent}</p>`;
+  (v.score_contradictions || []).forEach(msg => {
+    // 사용자가 결론만 읽고 틀린 숫자를 믿는 걸 막는 게 목적입니다.
+    h += `<div class="note"><span class="fail">⚠ ${msg}</span><br>위 표의 점수가 정확합니다.</div>`;
+  });
   h += `<div class="note">judge: ${v.judge_model} · 프롬프트 ${n(v.prompt_tokens)}tok`+
        (v.truncated?' · ⚠ 판정이 잘렸습니다':'')+`</div>`;
   $('verdict').innerHTML = h;

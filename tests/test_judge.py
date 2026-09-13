@@ -348,3 +348,71 @@ def test_verdict_size_has_one_definition():
     # 예산 = 사고 몫 + 내용 몫 × 1.5
     assert required_output_tokens(4, 2, thinking_reserve=0) == int(
         verdict_content_tokens(4, 2) * 1.5)
+
+
+# ── 산문의 점수가 표와 어긋나는 경우 (라이브: 합계 40 을 "23점" 이라 씀) ────
+
+
+def _verdict(conclusion: str = "", dissent: str = "") -> Verdict:
+    return Verdict(
+        per_issue=(),
+        rubric={"참가자 A": {"근거": 7, "논리": 7, "반박": 6, "명료성": 7, "일관성": 6},
+                "참가자 B": {"근거": 8, "논리": 8, "반박": 8, "명료성": 8, "일관성": 8}},
+        winner="참가자 B", margin="narrow", conclusion=conclusion, dissent=dissent)
+
+
+def test_wrong_total_in_the_conclusion_is_caught():
+    """모델이 자기 JSON 을 보고 합계를 다시 계산하다 틀립니다. 점수 필드는
+    정확하지만, 사용자가 결론만 읽으면 틀린 숫자를 믿습니다."""
+    from debate.judge import score_contradictions
+
+    notes = score_contradictions(_verdict("참가자 B가 23점으로 소폭 앞섰다"))
+
+    assert len(notes) == 1
+    assert "23점" in notes[0]
+    assert "참가자 B 40" in notes[0]        # 실제 합계를 같이 보여줍니다
+
+
+def test_correct_total_in_the_conclusion_passes():
+    from debate.judge import score_contradictions
+
+    assert score_contradictions(_verdict("참가자 B가 40점으로 앞섰다")) == ()
+
+
+@pytest.mark.parametrize("text", [
+    "B가 8점대로 고르게 높았다",              # 축 점수 범위 — 합계 주장이 아님
+    "스탠퍼드 13% 생산성 향상 연구를 인용했다",   # 백분율
+    "2020년 사례를 들었다",                   # 연도
+    "B가 근거의 구체성에서 앞섰다",             # 숫자 없음
+])
+def test_no_false_positives_on_ordinary_prose(text):
+    """오탐이 나면 경고가 노이즈가 되고, 노이즈가 되면 진짜도 무시됩니다."""
+    from debate.judge import score_contradictions
+
+    assert score_contradictions(_verdict(text)) == ()
+
+
+def test_dissent_is_checked_too():
+    from debate.judge import score_contradictions
+
+    notes = score_contradictions(_verdict("", "A 는 99점을 받을 만한 반론에 답하지 않았다"))
+    assert len(notes) == 1
+    assert "미해결 반론" in notes[0]
+
+
+def test_unparsed_verdict_is_not_checked():
+    """파싱 실패면 비교할 합계 자체가 없습니다."""
+    from dataclasses import replace
+    from debate.judge import score_contradictions
+
+    broken = replace(_verdict("23점"), status="unparsed", rubric={})
+    assert score_contradictions(broken) == ()
+
+
+def test_prompt_forbids_computing_totals_in_prose():
+    from debate.judge import REASONING_CHARS, _PROMPT
+    from debate.models import RUBRIC_KEYS
+
+    rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS,
+                              rubric_example=", ".join(f'"{k}": 7' for k in RUBRIC_KEYS))
+    assert "합계 점수를 쓰지 마십시오" in rendered

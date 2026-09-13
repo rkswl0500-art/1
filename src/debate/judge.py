@@ -138,6 +138,10 @@ _PROMPT = """당신은 토론 심판입니다. 참가자가 아니며, 어느 �
 - 각 "reasoning" 은 **2~3문장, {reasoning_chars}자 이내**로 쓰십시오. 길게 쓰면
   출력이 잘려 판정 전체가 무효가 됩니다.
 - "conclusion" 과 "dissent" 도 각각 2~3문장으로 제한하십시오.
+- **conclusion 과 dissent 에 합계 점수를 쓰지 마십시오.** 점수는 rubric 에 이미
+  있고 표로 제시됩니다. 산문에서 합계를 다시 계산하면 틀리기 쉽습니다 —
+  실제로 합계 40 인 참가자를 "23점으로 앞섰다"고 쓴 적이 있습니다.
+  누가 무엇으로 앞섰는지를 **말로** 쓰십시오.
 - **JSON 을 반드시 닫으십시오.** 중간에 끊기면 채점이 통째로 버려집니다.
 - 최고점이 동률이면 winner 를 null, margin 을 "tie" 로 하십시오.
 
@@ -306,6 +310,37 @@ def _parse(raw: str, labels: Sequence[str], issues: Sequence[Issue]) -> Verdict:
         conclusion=str(data.get("conclusion") or ""),
         dissent=str(data.get("dissent") or ""),
     )
+
+
+#: "23점" 처럼 점수를 주장하는 표현. 백분율("13%")이나 연도("2020년")는 걸리지
+#: 않도록 '점' 이 붙은 것만 봅니다 — 인용 수치를 오탐하면 경고가 노이즈가 됩니다.
+_SCORE_CLAIM = re.compile(r"(\d{1,3})\s*점")
+
+
+def score_contradictions(verdict: Verdict, axis_max: int = 10) -> tuple[str, ...]:
+    """산문에 적힌 점수가 루브릭 합계와 어긋나는지 봅니다.
+
+    파싱 문제가 아니라 **모델의 산술 오류**입니다. 점수 필드는 정확한데 결론만
+    틀리므로 판정을 버릴 이유는 없습니다. 다만 사용자가 결론만 읽으면 틀린 숫자를
+    믿게 되므로 표시는 해야 합니다.
+
+    축 점수 범위(0~10) 안의 숫자는 넘어갑니다 — "8점대로 고르게" 같은 표현은
+    합계 주장이 아닙니다. 그보다 큰 수가 실제 합계 중 어느 것과도 다를 때만
+    잡습니다.
+    """
+    if verdict.status != "ok":
+        return ()
+    valid = set(verdict.totals().values())
+    found: list[str] = []
+    for field, text in (("결론", verdict.conclusion), ("미해결 반론", verdict.dissent)):
+        for match in _SCORE_CLAIM.finditer(text or ""):
+            value = int(match.group(1))
+            if value > axis_max and value not in valid:
+                found.append(
+                    f"{field}에 '{value}점' 이라고 적혀 있는데 루브릭 합계와 "
+                    f"다릅니다 (실제 합계: "
+                    f"{', '.join(f'{k} {v}' for k, v in sorted(verdict.totals().items()))})")
+    return tuple(found)
 
 
 # ── 계열 관측 (막지 않고 기록만) ─────────────────────────────────────────────
