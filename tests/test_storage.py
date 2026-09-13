@@ -385,3 +385,63 @@ def test_ambiguous_bare_name_is_reported_unpriced():
     t = PricingTable({"a/m": ModelPrice(Decimal(1), Decimal(1)),
                       "b/m": ModelPrice(Decimal(9), Decimal(9))})
     assert t.cost_for("m", Usage(1_000_000, 0)) == (Decimal(0), False)
+
+
+def test_calibrate_compares_actuals_to_the_model(tmp_path, monkeypatch, capsys):
+    """'Groq 심판이 Gemini 보다 길게 쓰는가' 를 추측이 아니라 기록으로 답하려고
+    있습니다. 벤더별 상수를 넣을지는 이 숫자가 쌓인 뒤 결정할 문제입니다."""
+    from debate.cli import _cmd_calibrate
+    from debate.judge import verdict_content_tokens
+    from debate.models import AgentSpec, DebateResult, Issue, RoundResult, Usage, Utterance
+
+    db = tmp_path / "debates.db"
+    monkeypatch.setenv("DEBATE_DB_PATH", str(db))
+    store = SqliteStore(db)
+    specs = (AgentSpec("p1", "참가자 A", "g", "m-a", "x"),
+             AgentSpec("p2", "참가자 B", "g", "m-b", "x"))
+    result = DebateResult(
+        debate_id="d1", topic="t", participants=specs,
+        rounds=(RoundResult(1, (Utterance("p1", 1, "가" * 100, Usage(10, 70), 5,
+                                          Decimal(0)),), 0, 0, 1),),
+        issues=(Issue("i1", "a"), Issue("i2", "b"), Issue("i3", "c")))
+    meter = CostMeter(PricingTable({}), "d1")
+    meter.record(purpose="judge", agent_id=None, provider="groq",
+                 model="openai/gpt-oss-120b", usage=Usage(1963, 1504), latency_ms=1)
+    store.save(result, meter, None, None)
+    store.close()
+
+    assert _cmd_calibrate(object()) == 0
+    out = capsys.readouterr().out
+
+    assert "openai/gpt-oss-120b" in out
+    modelled = verdict_content_tokens(3, 2)
+    assert f"{modelled:,}" in out            # 모델값이 보여야 비교가 됩니다
+    assert "1,504" in out                    # 실측값도
+    assert "1.36x" in out or "1.35x" in out  # 비율 = 1504 / 1110
+
+
+def test_calibrate_without_records_is_not_an_error(tmp_path, monkeypatch, capsys):
+    from debate.cli import _cmd_calibrate
+
+    db = tmp_path / "empty.db"
+    monkeypatch.setenv("DEBATE_DB_PATH", str(db))
+    SqliteStore(db).close()
+
+    assert _cmd_calibrate(object()) == 0
+    assert "기록이 없습니다" in capsys.readouterr().out + capsys.readouterr().err
+
+
+def test_judge_output_range_covers_the_measured_underestimate():
+    """모델이 체계적으로 낮습니다(실측 1,504 대 1,110). 중앙값을 옮기지 않고
+    상한에 여유를 둡니다 — 한 건으로 배수를 확정하면 과적합입니다."""
+    from debate.judge import verdict_content_tokens
+
+    est = _estimator()
+    with_judge = est.estimate(participants=_specs(2), rounds=2, judge_model="m",
+                              topic="주제", issue_count=3)
+    without = est.estimate(participants=_specs(2), rounds=2, judge_model=None,
+                           topic="주제", issue_count=3)
+
+    judge_share = with_judge.tokens_high - without.tokens_high
+    assert judge_share > 1504            # 실측 출력이 상한 안에 들어와야 합니다
+    assert int(verdict_content_tokens(3, 2) * 1.5) >= 1504

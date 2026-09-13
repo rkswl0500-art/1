@@ -457,6 +457,77 @@ async def _cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    """기록된 실사용량을 견적 모델과 비교합니다.
+
+    "Groq 심판이 Gemini 보다 길게 쓰는가" 같은 질문을 **추측이 아니라 데이터로**
+    답하려고 있습니다. 벤더별 상수를 넣을지 말지는 여기 숫자가 쌓인 뒤에
+    결정할 문제입니다 — 한 건으로 배수를 확정하면 보정이 아니라 과적합입니다.
+    """
+    import sqlite3
+
+    from .judge import verdict_content_tokens
+
+    settings = Settings()
+    if not settings.db_path.is_file():
+        print(f"기록이 없습니다: {settings.db_path}", file=sys.stderr)
+        return 2
+
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    rows = list(conn.execute("""
+        SELECT l.model, l.out_tok, l.in_tok, d.debate_id,
+               (SELECT COUNT(*) FROM issues i WHERE i.debate_id = d.debate_id) AS issues,
+               (SELECT COUNT(*) FROM participants p WHERE p.debate_id = d.debate_id) AS parts
+        FROM llm_calls l JOIN debates d USING (debate_id)
+        WHERE l.purpose = 'judge' AND l.out_tok > 0
+        ORDER BY l.model
+    """))
+    if not rows:
+        print("판정 호출 기록이 없습니다.")
+        return 0
+
+    print("판정 출력: 실측 대 모델 (verdict_content_tokens)\n")
+    print(f"  {'모델':30} {'건수':>4} {'실측 평균':>9} {'모델 평균':>9} {'비율':>6}")
+    print("  " + "─" * 62)
+    by_model: dict[str, list[tuple[int, int]]] = {}
+    for r in rows:
+        modelled = verdict_content_tokens(max(1, r["issues"]), max(1, r["parts"]))
+        by_model.setdefault(r["model"], []).append((r["out_tok"], modelled))
+
+    for model, pairs in sorted(by_model.items()):
+        actual = sum(a for a, _ in pairs) / len(pairs)
+        modelled = sum(m for _, m in pairs) / len(pairs)
+        ratio = actual / modelled if modelled else 0
+        print(f"  {model:30} {len(pairs):>4} {actual:>9,.0f} {modelled:>9,.0f} {ratio:>5.2f}x")
+
+    print("\n  비율 1.00 이면 모델이 정확합니다. 1 보다 크면 모델이 낮게 잡는 것입니다.")
+    if len(by_model) > 1:
+        print("  모델(벤더)마다 비율이 뚜렷이 다르면 프로바이더별 계수를 둘 근거가 됩니다.")
+    else:
+        print(f"  비교하려면 다른 심판 모델로도 돌려야 합니다 (지금 {len(by_model)}종).")
+
+    turns = list(conn.execute("""
+        SELECT p.model, COUNT(*) n, AVG(u.out_tok) avg_out, AVG(LENGTH(u.content)) avg_chars
+        FROM utterances u JOIN participants p
+          ON p.debate_id = u.debate_id AND p.agent_id = u.agent_id
+        WHERE u.status = 'ok' AND u.out_tok > 0
+        GROUP BY p.model
+    """))
+    if turns:
+        print("\n발언 1건: 실측 (견적 가정 R1 250~450자 / R2+ 350~600자)\n")
+        print(f"  {'모델':30} {'건수':>4} {'출력토큰':>8} {'글자':>7} {'토큰/자':>7}")
+        print("  " + "─" * 62)
+        for r in turns:
+            per = r["avg_out"] / r["avg_chars"] if r["avg_chars"] else 0
+            print(f"  {r['model']:30} {r['n']:>4} {r['avg_out']:>8,.0f} "
+                  f"{r['avg_chars']:>7,.0f} {per:>7.2f}")
+        print(f"\n  토큰/자 가 설정값({settings.ko_tokens_per_char})과 크게 다르면 "
+              "DEBATE_KO_TOKENS_PER_CHAR 를 조정하십시오.")
+    conn.close()
+    return 0
+
+
 async def _cmd_estimate(args: argparse.Namespace) -> int:
     """LLM 을 한 번도 부르지 않고 비용 범위를 냅니다."""
     settings = Settings()
@@ -665,8 +736,14 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--provider-override", choices=[FAKE_PROVIDER])
     e.set_defaults(fn=_cmd_estimate)
 
+    cal = sub.add_parser("calibrate",
+                         help="기록된 실사용량을 견적 모델과 비교 (벤더별 비교 포함)")
+    cal.set_defaults(fn=_cmd_calibrate, sync=True)
+
     args = parser.parse_args(argv)
     try:
+        if getattr(args, "sync", False):
+            return args.fn(args)
         return asyncio.run(args.fn(args))
     except ConfigError as e:
         print(f"ConfigError: {e}", file=sys.stderr)

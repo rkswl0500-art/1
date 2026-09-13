@@ -258,11 +258,18 @@ class Estimator:
             # 판정 출력은 쟁점·참가자·루브릭 축 수에 비례합니다. judge.py 가
             # 예산을 잡을 때 쓰는 함수를 그대로 씁니다 — 따로 추정하면 한쪽만
             # 갱신되어 어긋납니다(실제로 견적 쪽이 쟁점 수를 무시하고 있었습니다).
+            # 판정 출력 범위.
+            #
+            # verdict_content_tokens 는 JSON 구성요소를 더한 값이라 **체계적으로
+            # 낮습니다** — 실측 한 건에서 모델 1,110 대 실제 1,504(1.35배)였습니다.
+            # 중앙값을 그 배수로 옮기지 않고 **상한에 여유를 둡니다.** 한 건으로
+            # 배수를 확정하는 건 보정이 아니라 과적합이고, 모델이 낮다는 사실
+            # 자체는 확실하기 때문입니다.
             content = verdict_content_tokens(issue_count, n)
             add(judge_model,
                 self._tok(sum(transcript_lo) + _ISSUES_CHARS),
                 self._tok(sum(transcript_hi) + _ISSUES_CHARS),
-                content // 2, content)
+                int(content * 0.7), int(content * 1.5))
             # 복구 호출은 같은 프롬프트를 다시 보내는 것이라 한 번 더 친 것과
             # 비슷합니다. 본 범위가 아니라 별도 항목으로 냅니다.
             repair_tokens = tok_hi - before_hi
