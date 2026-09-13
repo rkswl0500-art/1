@@ -22,7 +22,9 @@ import yaml
 from .agent import (
     Agent, Anonymizer, Moderator, parse_participant_line, split_provider_model,
 )
-from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
+from .config import (
+    FAKE_PROVIDER, PricingTable, Settings, load_provider_slots, provider_registry,
+)
 from .cost import CostMeter, Estimator
 from .context import ContextBuilder
 from .engine import DebateEngine
@@ -429,7 +431,7 @@ async def _cmd_models(args: argparse.Namespace) -> int:
             print(m)
         return 0
 
-    registry = load_provider_slots()
+    registry = provider_registry(settings)
     if name not in registry:
         raise ConfigError(
             f"프로바이더 {name!r} 를 찾을 수 없습니다.\n  {registry.source_hint()}"
@@ -500,7 +502,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     _current_budget = settings.max_output_tokens
     pool = build_pool(
         specs,
-        None if fake else load_provider_slots(),
+        None if fake else provider_registry(settings),
         meter,
         settings,
         fake=_build_fake(specs, args.fake_latency, args.fail_agent,

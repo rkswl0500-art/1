@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     judge_timeout_s: float = 300.0
     #: 0 이면 쟁점·참가자 수에 맞춰 자동 계산합니다(judge.required_output_tokens).
     judge_max_tokens: int = 0
+    #: 프로바이더 설정 UI. "local" 이면 루프백 클라이언트만, "off" 면 완전 차단.
+    #:
+    #: 이 엔드포인트는 .env 를 쓰고 키를 다룹니다. 여러 기기에서 접근하는 구성으로
+    #: 옮길 때는 반드시 "off" 로 두십시오.
+    config_ui: str = "local"
+    env_path: Path = Path(".env")
 
     @property
     def retry_budget_s(self) -> float:
@@ -232,6 +238,17 @@ def load_provider_slots(
         )
 
     return ProviderRegistry(slots=slots, env_file=resolved, env_file_found=found)
+
+
+def provider_registry(settings: "Settings | None" = None) -> ProviderRegistry:
+    """설정이 가리키는 .env 에서 슬롯을 읽습니다.
+
+    `load_provider_slots()` 를 그냥 부르면 항상 CWD 의 `.env` 를 봅니다. 설정 UI 가
+    `env_path` 에 쓰는데 읽기는 다른 곳을 보면 방금 저장한 슬롯이 안 보입니다 —
+    실제로 그렇게 어긋나 있었습니다. 쓰는 곳과 읽는 곳을 한 값으로 묶습니다.
+    """
+    s = settings or Settings()
+    return load_provider_slots(env_file=s.env_path)
 
 
 # ── 가격표 ───────────────────────────────────────────────────────────────────

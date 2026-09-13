@@ -34,6 +34,12 @@ button.ghost{background:transparent;color:var(--accent);border:1px solid var(--a
 button.chip{background:transparent;color:var(--muted);border:1px solid var(--line);
   font-weight:500;font-size:12px;padding:3px 9px}
 button.chip:hover{color:var(--accent);border-color:var(--accent)}
+.slot{border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px}
+.slot .row{gap:8px;align-items:flex-end}
+.slot .f{flex:1;min-width:130px}
+.slot .f.wide{flex:2.4;min-width:240px}
+.mask{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted)}
+.ok{color:var(--ok);font-weight:600}
 button:disabled{opacity:.45;cursor:not-allowed}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 
@@ -109,6 +115,26 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="metric"><span class="k">입력 / 출력</span><span class="v small" id="m-io">0 / 0</span></div>
     <div class="metric"><span class="k">비용</span><span class="v small" id="m-cost">$0</span></div>
     <div class="est" id="m-est">견적: 아직 없음</div>
+  </div>
+
+  <div class="panel" id="cfg-panel">
+    <div class="row" style="justify-content:space-between">
+      <strong>프로바이더 설정</strong>
+      <button class="chip" id="cfg-toggle">열기</button>
+    </div>
+    <div id="cfg-body" hidden>
+      <div class="note" id="cfg-path"></div>
+      <div class="note">키는 서버에만 저장됩니다. 화면에는 마스킹만 표시되고,
+        <strong>수정하지 않으면 비워 두십시오</strong> — 기존 키가 그대로 유지됩니다.</div>
+      <div id="cfg-slots"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="ghost" id="cfg-add">＋ 슬롯 추가</button>
+        <span class="note" style="margin:0">프리셋:</span>
+        <span id="cfg-presets"></span>
+        <button id="cfg-save" style="margin-left:auto">저장</button>
+      </div>
+      <div class="note" id="cfg-msg"></div>
+    </div>
   </div>
 
   <div class="panel" id="setup">
@@ -188,6 +214,100 @@ fake/fake-c | 중립 | 비용과 트레이드오프를 따지는 회의주의자
 
 <script>
 const $ = id => document.getElementById(id);
+
+// ── 프로바이더 설정 ────────────────────────────────────────────────────────
+// 키는 절대 브라우저로 내려오지 않습니다. 목록에는 마스킹만 있고, 저장할 때
+// 비워 보내면 서버가 기존 키를 유지합니다.
+let cfgSlots = [], cfgPresets = [];
+
+async function cfgLoad(){
+  const r = await fetch('/config/providers');
+  if(!r.ok){
+    const j = await r.json().catch(()=>({}));
+    $('cfg-body').innerHTML =
+      `<div class="note fail">${j.detail || '설정을 불러올 수 없습니다'}</div>`;
+    return;
+  }
+  const j = await r.json();
+  cfgSlots = j.slots.map(s => ({...s, api_key: ''}));
+  cfgPresets = j.presets;
+  $('cfg-path').textContent = `.env: ${j.env_path}${j.env_exists ? '' : ' (아직 없음 — 저장하면 생성됩니다)'}`;
+  $('cfg-presets').innerHTML = cfgPresets
+    .map((p,i)=>`<button class="chip" data-preset="${i}">${p.name}</button>`).join(' ');
+  $('cfg-presets').querySelectorAll('[data-preset]').forEach(b => b.onclick = () => {
+    const p = cfgPresets[+b.dataset.preset];
+    cfgSlots.push({name:p.name, base_url:p.base_url, api_key:'', key_masked:'', has_key:false});
+    cfgRender();
+  });
+  cfgRender();
+}
+
+function cfgRender(){
+  $('cfg-slots').innerHTML = cfgSlots.map((s,i)=>`
+    <div class="slot">
+      <div class="row">
+        <div class="f"><label>이름</label>
+          <input data-i="${i}" data-k="name" value="${s.name}"></div>
+        <div class="f wide"><label>BASE_URL (…/v1 까지)</label>
+          <input data-i="${i}" data-k="base_url" value="${s.base_url}"></div>
+        <div class="f wide"><label>API 키 ${s.has_key
+            ? `<span class="mask">현재: ${s.key_masked}</span> — 비우면 유지`
+            : '<span class="mask">미설정</span>'}</label>
+          <input data-i="${i}" data-k="api_key" type="password"
+                 placeholder="${s.has_key ? '변경할 때만 입력' : '키 붙여넣기'}"
+                 value="${s.api_key}"></div>
+        <button class="chip" data-test="${i}">연결 테스트</button>
+        <button class="chip" data-del="${i}">삭제</button>
+      </div>
+      <div class="note" id="cfg-r${i}">${cfgPresets.find(p=>p.name===s.name)?.['키 발급'] || ''}</div>
+    </div>`).join('');
+
+  $('cfg-slots').querySelectorAll('input').forEach(inp => inp.oninput = () => {
+    cfgSlots[+inp.dataset.i][inp.dataset.k] = inp.value;
+  });
+  $('cfg-slots').querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
+    cfgSlots.splice(+b.dataset.del, 1); cfgRender();
+  });
+  $('cfg-slots').querySelectorAll('[data-test]').forEach(b => b.onclick = async () => {
+    const i = +b.dataset.test, s = cfgSlots[i], out = $('cfg-r'+i);
+    out.textContent = '연결 확인 중…';
+    try{
+      const j = await post('/config/providers/test',
+        {name:s.name, base_url:s.base_url, api_key:s.api_key});
+      out.innerHTML = j.ok
+        ? `<span class="ok">연결됨 · 모델 ${j.count}개</span>` +
+          `${j.used_stored_key ? ' (저장된 키 사용)' : ''}<br>` +
+          `<span class="mask">${j.models.slice(0,6).join(', ')}${j.count>6?' …':''}</span>`
+        : `<span class="fail">실패: ${j.error}</span>`;
+    }catch(err){ out.innerHTML = `<span class="fail">실패: ${err.message}</span>`; }
+  });
+}
+
+$('cfg-toggle').onclick = async () => {
+  const body = $('cfg-body');
+  body.hidden = !body.hidden;
+  $('cfg-toggle').textContent = body.hidden ? '열기' : '닫기';
+  if(!body.hidden && !cfgSlots.length) await cfgLoad();
+};
+$('cfg-add') && ($('cfg-add').onclick = () => {
+  cfgSlots.push({name:'', base_url:'', api_key:'', key_masked:'', has_key:false});
+  cfgRender();
+});
+$('cfg-save') && ($('cfg-save').onclick = async () => {
+  $('cfg-msg').textContent = '저장 중…';
+  try{
+    const r = await fetch('/config/providers', {
+      method:'PUT', headers:{'content-type':'application/json'},
+      body: JSON.stringify({slots: cfgSlots.map(s =>
+        ({name:s.name, base_url:s.base_url, api_key:s.api_key}))}),
+    });
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.detail || '저장 실패');
+    $('cfg-msg').innerHTML =
+      `<span class="ok">저장됨</span> — ${j.path} · 슬롯: ${j.names.join(', ')}`;
+    await cfgLoad();                       // 마스킹 갱신 + 입력한 키는 화면에서 제거
+  }catch(err){ $('cfg-msg').innerHTML = `<span class="fail">${err.message}</span>`; }
+});
 const n = x => (x ?? 0).toLocaleString('ko-KR');
 let debateId = null, es = null, cards = {}, timers = {}, gateDeadline = null, gateTick = null;
 // 마지막으로 렌더링한 이벤트 번호. 재연결로 같은 이벤트가 다시 와도 무시합니다.
@@ -441,7 +561,10 @@ function refreshStanceHint(){
 }
 $('agents').addEventListener('input', refreshStanceHint);
 
-document.querySelectorAll('.chip').forEach(btn => btn.onclick = () => {
+// [data-fill] 로 좁힙니다. '.chip' 전체를 잡으면 설정 패널의 토글·프리셋
+// 버튼까지 물려서 그쪽 핸들러를 덮어씁니다 — 실제로 그래서 설정 패널이
+// 열리지 않았습니다.
+document.querySelectorAll('.chip[data-fill]').forEach(btn => btn.onclick = () => {
   const heads = $('agents').value.split('\n')
                   .map(s => s.split('|')[0].trim()).filter(Boolean);
   if(!heads.length) heads.push('fake/fake-a');

@@ -18,9 +18,14 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .agent import DEFAULT_PERSONA_FALLBACK, split_provider_model
-from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
+from .config import (
+    FAKE_PROVIDER, PricingTable, Settings, load_provider_slots,
+    provider_registry,
+)
+from .config import _NAME_RE as _NAME_OK
 from .cost import CostMeter, Estimator
 from .judge import family_note, vendor_family
+from .envfile import SlotInput, mask_key, save_slots
 from .models import AgentSpec, ConfigError
 from .provider import FakeProvider, build_pool
 from .session import (
@@ -75,6 +80,157 @@ def _session(debate_id: str) -> DebateSession:
         raise HTTPException(404, f"debate {debate_id} 를 찾을 수 없습니다") from None
 
 
+# ── 프로바이더 설정 ──────────────────────────────────────────────────────────
+
+#: 루프백으로 인정하는 주소.
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+#: 프록시를 거쳤다는 표시. 설정 편집은 직접 로컬 접속만 받습니다.
+_PROXY_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host")
+
+PROVIDER_PRESETS = [
+    {"name": "gemini",
+     "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+     "키 발급": "https://aistudio.google.com — Get API key"},
+    {"name": "groq", "base_url": "https://api.groq.com/openai/v1",
+     "키 발급": "https://console.groq.com/keys (무료 티어, 레이트리밋 빡빡)"},
+    {"name": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+     "키 발급": "https://openrouter.ai/keys (무료 모델은 :free 로 끝남)"},
+]
+
+
+def _require_local(request: Request) -> None:
+    """설정 편집은 직접 로컬 접속에서만.
+
+    **바인드 주소로는 판별할 수 없습니다.** `scope["server"]` 는 그 연결의 로컬
+    소켓 주소라서, 0.0.0.0 으로 띄우고 localhost 로 접속하면 127.0.0.1 로
+    보입니다(실측). 그래서 "외부에서 닿을 수 있는가"가 아니라 "이 요청이 외부에서
+    왔는가"를 막습니다 — 실제로 지켜야 할 성질은 그쪽입니다.
+
+    클라이언트 주소는 밖에서 위조할 수 없습니다. 외부 IP 에서
+    `X-Forwarded-For: 127.0.0.1` 을 붙여도 uvicorn 이 무시합니다(실측).
+    """
+    settings = Settings()
+    if settings.config_ui.lower() != "local":
+        raise HTTPException(404, "설정 UI 가 꺼져 있습니다 (DEBATE_CONFIG_UI)")
+
+    present = [h for h in _PROXY_HEADERS if h in request.headers]
+    if present:
+        raise HTTPException(403, (
+            f"프록시를 거친 요청은 설정을 편집할 수 없습니다 ({', '.join(present)}). "
+            "서버가 있는 컴퓨터에서 직접 열어 주십시오."))
+
+    client = request.client.host if request.client else None
+    if client not in _LOOPBACK:
+        raise HTTPException(403, (
+            f"설정 편집은 로컬에서만 가능합니다 (요청 출처: {client}). "
+            "이 화면은 .env 를 쓰고 API 키를 다룹니다."))
+
+
+class SlotIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    base_url: str = Field(min_length=1)
+    #: 비우면 **기존 키를 유지**합니다. 화면에는 마스킹만 내려가므로, 수정하지
+    #: 않은 슬롯의 키를 브라우저가 되돌려 보낼 방법이 아예 없습니다.
+    api_key: str = ""
+
+
+class SaveSlots(BaseModel):
+    slots: list[SlotIn] = Field(max_length=9)
+
+
+class TestSlot(BaseModel):
+    name: str = ""
+    base_url: str = Field(min_length=1)
+    api_key: str = ""
+
+
+def _stored_keys() -> dict[str, str]:
+    registry = provider_registry()
+    out: dict[str, str] = {}
+    for name in registry.names():
+        slot = registry.get(name)
+        out[name] = slot.api_key.get_secret_value() if slot.api_key else ""
+    return out
+
+
+@app.get("/config/providers")
+async def config_list(request: Request) -> dict:
+    """슬롯 목록. **키는 마스킹만 내려갑니다.**"""
+    _require_local(request)
+    settings = Settings()
+    registry = provider_registry()
+    return {
+        "env_path": str(settings.env_path.resolve()),
+        "env_exists": settings.env_path.is_file(),
+        "slots": [
+            {"name": name,
+             "base_url": registry.get(name).base_url,
+             "key_masked": mask_key(
+                 registry.get(name).api_key.get_secret_value()
+                 if registry.get(name).api_key else None),
+             "has_key": registry.get(name).has_key}
+            for name in registry.names()
+        ],
+        "presets": PROVIDER_PRESETS,
+    }
+
+
+@app.post("/config/providers/test")
+async def config_test(request: Request, body: TestSlot) -> dict:
+    """저장 전 연결 확인. 모델 목록을 가져와 보여줍니다."""
+    _require_local(request)
+    from pydantic import SecretStr
+
+    from .config import ProviderSlot
+    from .provider import OpenAICompatProvider
+
+    key = body.api_key or _stored_keys().get(body.name.strip().lower(), "")
+    slot = ProviderSlot(name=body.name or "test",
+                        base_url=body.base_url.strip().rstrip("/"),
+                        api_key=SecretStr(key) if key else None)
+    provider = OpenAICompatProvider(slot, timeout_s=20.0)
+    try:
+        models = await provider.list_models()
+        return {"ok": True, "models": models[:50], "count": len(models),
+                "used_stored_key": not body.api_key and bool(key)}
+    except Exception as e:                                  # noqa: BLE001
+        # 예외 문자열에 키가 섞이지 않게: 프로바이더 에러는 본문 앞부분만 담습니다.
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
+    finally:
+        await provider.aclose()
+
+
+@app.put("/config/providers")
+async def config_save(request: Request, body: SaveSlots) -> dict:
+    """.env 를 갱신합니다. BOM 없는 UTF-8, 원자적 교체, 권한 0600."""
+    _require_local(request)
+    settings = Settings()
+    stored = _stored_keys()
+
+    seen: set[str] = set()
+    slots: list[SlotInput] = []
+    for entry in body.slots:
+        name = entry.name.strip().lower()
+        if not _NAME_OK.match(name):
+            raise HTTPException(400, f"프로바이더 이름 {name!r}: 소문자/숫자/_/- 만 됩니다")
+        if name == FAKE_PROVIDER:
+            raise HTTPException(400, f"{FAKE_PROVIDER!r} 는 예약어입니다")
+        if name in seen:
+            raise HTTPException(400, f"프로바이더 이름 중복: {name!r}")
+        base_url = entry.base_url.strip().rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            raise HTTPException(400, f"{name}: BASE_URL 은 http(s):// 로 시작해야 합니다")
+        seen.add(name)
+        # 빈 키 = 기존 유지. 이름이 바뀌었으면 기존 키가 없으므로 빈 값이 됩니다.
+        slots.append(SlotInput(name, base_url, entry.api_key or stored.get(name, "")))
+
+    save_slots(settings.env_path, slots)
+    registry = provider_registry()      # 바로 다시 읽어 반영 확인
+    return {"saved": True, "path": str(settings.env_path.resolve()),
+            "names": list(registry.names())}
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(_STATIC / "index.html")
@@ -85,7 +241,7 @@ async def models(provider: str = FAKE_PROVIDER) -> dict:
     """모델 ID 목록. base_url·키는 응답에 넣지 않습니다."""
     if provider == FAKE_PROVIDER:
         return {"provider": provider, "models": await FakeProvider().list_models()}
-    registry = load_provider_slots()
+    registry = provider_registry()
     if provider not in registry:
         raise HTTPException(400, f"프로바이더 {provider!r} 없음. "
                                  f"사용 가능: {', '.join(registry.names()) or '<없음>'}")
@@ -102,7 +258,7 @@ async def models(provider: str = FAKE_PROVIDER) -> dict:
 @app.get("/providers")
 async def providers() -> dict:
     """설정된 프로바이더 **이름만**. base_url 도 키도 내보내지 않습니다."""
-    return {"providers": list(load_provider_slots().names()), "fake": FAKE_PROVIDER}
+    return {"providers": list(provider_registry().names()), "fake": FAKE_PROVIDER}
 
 
 @app.post("/debates")
@@ -140,7 +296,7 @@ async def create(body: CreateDebate) -> dict:
                                     judge_spec[1], ""))
     try:
         pool = build_pool(
-            pool_specs, None if body.use_fake else load_provider_slots(),
+            pool_specs, None if body.use_fake else provider_registry(settings),
             meter, settings,
             fake=_make_fake(body) if body.use_fake else None,
         )
