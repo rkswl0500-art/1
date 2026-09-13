@@ -183,11 +183,19 @@ class DebateSession:
                 "out_tok": rep.completion_tokens, "total_tok": rep.total_tokens,
                 "cost_usd": str(rep.total_usd.quantize(Decimal("0.000001")))}
 
-    def subscribe(self) -> asyncio.Queue:
-        """구독 시작 시 지금까지의 이벤트를 먼저 밀어 넣습니다 (재접속 복구)."""
+    def subscribe(self, after_seq: int | None = None) -> asyncio.Queue:
+        """구독 시작 시 밀린 이벤트를 먼저 밀어 넣습니다.
+
+        after_seq 는 브라우저가 보낸 Last-Event-ID 입니다. 자동 재연결이면
+        브라우저가 마지막으로 받은 seq 를 보내므로 그 **이후만** 재생합니다.
+        새 탭이나 새로고침이면 헤더가 없으므로 전체를 재생합니다 — DOM 이
+        비어 있어서 전부 필요하니까요. EventSource 가 자동 재연결일 때만
+        헤더를 붙이므로 이 구분은 공짜로 얻어집니다.
+        """
         queue: asyncio.Queue = asyncio.Queue()
         for payload in self.events:
-            queue.put_nowait(payload)
+            if after_seq is None or payload.get("seq", -1) > after_seq:
+                queue.put_nowait(payload)
         self.subscribers.add(queue)
         return queue
 

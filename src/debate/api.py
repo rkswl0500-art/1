@@ -13,7 +13,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -197,12 +197,19 @@ async def start(debate_id: str) -> dict:
 
 
 @app.get("/debates/{debate_id}/stream")
-async def stream(debate_id: str) -> StreamingResponse:
-    """SSE. 접속 시 지금까지의 이벤트를 먼저 재생하고 이후 실시간으로 흘립니다."""
+async def stream(debate_id: str, request: Request) -> StreamingResponse:
+    """SSE. 밀린 이벤트를 재생하고 이후 실시간으로 흘립니다.
+
+    각 이벤트에 `id: <seq>` 를 붙입니다. 브라우저는 재연결 시 마지막 id 를
+    Last-Event-ID 헤더로 돌려주므로, 자동 재연결에서는 그 이후만 보냅니다.
+    이게 없으면 재연결마다 전체 버퍼가 다시 흘러가 화면이 중복 누적됩니다.
+    """
     session = _session(debate_id)
+    raw_id = request.headers.get("last-event-id")
+    after = int(raw_id) if raw_id and raw_id.lstrip("-").isdigit() else None
 
     async def gen():
-        queue = session.subscribe()
+        queue = session.subscribe(after_seq=after)
         try:
             while True:
                 try:
@@ -210,8 +217,12 @@ async def stream(debate_id: str) -> StreamingResponse:
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"      # 프록시가 끊지 않게
                     continue
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield (f"id: {payload.get('seq', 0)}\n"
+                       f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
                 if payload.get("type") == "finished":
+                    # 스트림을 닫으면 EventSource 는 그걸 '끊김'으로 보고 다시
+                    # 붙습니다(정상 종료여도). 클라이언트가 close() 하도록
+                    # 알린 뒤, 재접속해도 커서 이후에는 보낼 게 없습니다.
                     break
         finally:
             session.unsubscribe(queue)

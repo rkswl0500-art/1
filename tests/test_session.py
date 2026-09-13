@@ -131,3 +131,67 @@ async def test_late_subscriber_receives_the_backlog():
 
     session.unsubscribe(queue)
     assert session.subscribers == set()
+
+
+# ── 재연결 시 중복 재생 (실측으로 드러난 버그) ──────────────────────────────
+
+
+def _session_with(events: list[dict]):
+    from debate.session import DebateSession
+
+    s = DebateSession.__new__(DebateSession)
+    s.events = events
+    s.subscribers = set()
+    return s
+
+
+def test_reconnect_cursor_sends_only_later_events():
+    """브라우저는 자동 재연결 시 마지막 id 를 Last-Event-ID 로 돌려줍니다.
+    그 이후만 보내지 않으면 재연결마다 전체 버퍼가 다시 흘러가 화면이
+    중복 누적됩니다 — 실제로 20회 재연결에 발언이 36개까지 불어났습니다."""
+    session = _session_with([{"type": f"e{i}", "seq": i} for i in range(6)])
+
+    queue = session.subscribe(after_seq=2)
+    got = [queue.get_nowait()["seq"] for _ in range(queue.qsize())]
+
+    assert got == [3, 4, 5]
+
+
+def test_fresh_subscriber_without_cursor_gets_everything():
+    """새 탭·새로고침은 DOM 이 비어 있으므로 전체가 필요합니다. EventSource 는
+    자동 재연결일 때만 헤더를 붙이므로 이 구분은 공짜로 얻어집니다."""
+    session = _session_with([{"type": f"e{i}", "seq": i} for i in range(4)])
+
+    assert session.subscribe().qsize() == 4
+    assert session.subscribe(after_seq=None).qsize() == 4
+
+
+def test_cursor_at_the_end_yields_nothing():
+    """토론이 끝난 뒤 다시 붙어도 보낼 게 없어야 합니다."""
+    session = _session_with([{"type": f"e{i}", "seq": i} for i in range(4)])
+    assert session.subscribe(after_seq=3).qsize() == 0
+
+
+def test_cursor_beyond_the_buffer_is_not_an_error():
+    session = _session_with([{"type": "e0", "seq": 0}])
+    assert session.subscribe(after_seq=999).qsize() == 0
+
+
+def test_every_emitted_event_carries_a_monotonic_seq():
+    """클라이언트 중복 제거가 seq 에 기대므로 빠지거나 뒤섞이면 안 됩니다."""
+    import asyncio
+
+    from debate.config import PricingTable
+    from debate.cost import CostMeter
+    from debate.session import DebateSession
+
+    s = DebateSession.__new__(DebateSession)
+    s.events, s.subscribers = [], set()
+    s.meter = CostMeter(PricingTable({}), "d")
+
+    async def run():
+        for i in range(5):
+            await s.emit_raw({"type": f"e{i}"})
+
+    asyncio.run(run())
+    assert [e["seq"] for e in s.events] == [0, 1, 2, 3, 4]

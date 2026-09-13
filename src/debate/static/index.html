@@ -174,6 +174,12 @@ fake/fake-c</textarea>
 const $ = id => document.getElementById(id);
 const n = x => (x ?? 0).toLocaleString('ko-KR');
 let debateId = null, es = null, cards = {}, timers = {}, gateDeadline = null, gateTick = null;
+// 마지막으로 렌더링한 이벤트 번호. 재연결로 같은 이벤트가 다시 와도 무시합니다.
+// 서버가 Last-Event-ID 로 이미 걸러주지만, 클라이언트도 멱등해야 화면이
+// 어떤 경우에도 중복 누적되지 않습니다.
+let lastSeq = -1;
+
+function closeStream(){ if(es){ es.close(); es = null; } }
 
 function log(msg){ const el=$('log'); el.textContent += msg+'\n'; el.scrollTop = el.scrollHeight; }
 
@@ -225,6 +231,10 @@ function roundHeader(no){
 }
 
 function handle(ev){
+  if(typeof ev.seq === 'number'){
+    if(ev.seq <= lastSeq) return;     // 이미 그린 이벤트
+    lastSeq = ev.seq;
+  }
   setMetrics(ev.running);
   switch(ev.type){
     case 'debate_started':
@@ -275,6 +285,9 @@ function handle(ev){
       openGate(ev.round_no, ev.timeout_s); break;
     case 'verdict': showVerdict(ev); break;
     case 'finished':
+      // 닫지 않으면 EventSource 가 3초마다 다시 붙고 서버가 버퍼를 다시
+      // 재생해서 화면이 무한히 중복됩니다.
+      closeStream();
       closeGate();
       $('status-line').textContent = `종료 — ${ev.status} (사람 대기 ${ev.waited_s}초)`;
       Object.keys(timers).forEach(stopTimer);
@@ -343,6 +356,10 @@ $('btn-create').onclick = async () => {
       gate_timeout_s: +$('gatesec').value,
     });
     debateId = j.debate_id;
+    closeStream(); lastSeq = -1;
+    $('transcript').innerHTML = ''; $('log').textContent = '';
+    $('verdict-panel').style.display = 'none';
+    $('issues-panel').style.display = 'none';
     const e = j.estimate;
     $('m-est').innerHTML = `견적: 호출 <strong>${n(e.calls)}</strong>회 ·
       토큰 <strong>${n(e.tokens_low)}~${n(e.tokens_high)}</strong>
@@ -360,7 +377,7 @@ $('btn-start').onclick = async () => {
   $('btn-start').disabled = true; $('btn-create').disabled = true;
   es = new EventSource(`/debates/${debateId}/stream`);
   es.onopen = () => $('conn').textContent = '연결됨 (SSE)';
-  es.onerror = () => $('conn').textContent = '연결 끊김 — 새로고침하면 이어서 봅니다';
+  es.onerror = () => { if(es) $('conn').textContent = '재연결 중…'; };
   es.onmessage = m => handle(JSON.parse(m.data));
   await post(`/debates/${debateId}/start`);
 };

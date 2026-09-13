@@ -236,3 +236,50 @@ async def test_engine_uses_the_debate_id_it_was_given():
 
     assert result.debate_id == "d_fixed"
     assert {r.debate_id for r in meter.records} == {"d_fixed"}
+
+
+def test_sse_stream_honours_last_event_id():
+    """서버 계약: id 필드를 붙이고, Last-Event-ID 이후만 보냅니다."""
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from debate import api
+
+    with TestClient(api.app) as client:
+        r = client.post("/debates", json={
+            "topic": "T",
+            "participants": [{"provider": "fake", "model": "fa"},
+                             {"provider": "fake", "model": "fb"}],
+            "rounds": 1, "use_fake": True, "gate_timeout_s": 0,
+            "fake_latency_ms": {"fa": 1, "fb": 1},
+        })
+        did = r.json()["debate_id"]
+        client.post(f"/debates/{did}/start")
+
+        def read(headers=None):
+            ids, types = [], []
+            with client.stream("GET", f"/debates/{did}/stream",
+                               headers=headers or {}) as s:
+                cur = None
+                for line in s.iter_lines():
+                    if line.startswith("id: "):
+                        cur = int(line[4:])
+                    elif line.startswith("data: "):
+                        import json as _j
+                        types.append(_j.loads(line[6:])["type"])
+                        ids.append(cur)
+                        if types[-1] == "finished":
+                            break
+            return ids, types
+
+        ids, types = read()
+        assert ids and ids == sorted(ids)
+        assert ids[0] == 0                         # id 가 seq 와 같음
+        assert "finished" in types
+
+        cut = ids[len(ids) // 2]
+        ids2, _ = read({"last-event-id": str(cut)})
+        assert all(i > cut for i in ids2)          # 커서 이하 재전송 없음
+
+        ids3, _ = read()                           # 헤더 없으면 전체 재생
+        assert ids3 == ids
