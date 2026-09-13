@@ -31,6 +31,9 @@ textarea{resize:vertical;min-height:64px}
 button{padding:8px 14px;border:0;border-radius:7px;background:var(--accent);
   color:#fff;font:inherit;font-weight:600;cursor:pointer}
 button.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+button.chip{background:transparent;color:var(--muted);border:1px solid var(--line);
+  font-weight:500;font-size:12px;padding:3px 9px}
+button.chip:hover{color:var(--accent);border-color:var(--accent)}
 button:disabled{opacity:.45;cursor:not-allowed}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 
@@ -49,6 +52,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
 .card{border:1px solid var(--line);border-radius:9px;padding:10px 12px;background:var(--bg)}
 .card .lab{font-weight:700}
+.stance{font-size:11px;font-weight:600;margin-left:6px;padding:1px 6px;border-radius:5px;background:var(--accent);color:#fff}
 .card .mdl{font-size:11px;color:var(--muted);word-break:break-all;margin-bottom:6px}
 .state{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--idle);flex:none}
@@ -120,10 +124,18 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
         <label>개입 대기(초)</label><input id="gatesec" type="number" value="120" min="0" max="1800">
       </div>
     </div>
-    <label>참가자 — 한 줄에 <code>provider/model</code></label>
-    <textarea id="agents">fake/fake-a
-fake/fake-b
-fake/fake-c</textarea>
+    <label>참가자 — 한 줄에 <code>provider/model | 입장 | 페르소나</code>
+      <span class="note" style="margin:0">(입장·페르소나는 선택. 구분자는
+      <code>|</code> — 모델 ID 에 콜론이 들어가므로)</span></label>
+    <textarea id="agents" rows="4">fake/fake-a | 찬성 | 데이터와 측정 방법을 중시하는 실증주의자
+fake/fake-b | 반대 | 조직 문화와 암묵지 전수를 중시하는 현장주의자
+fake/fake-c | 중립 | 비용과 트레이드오프를 따지는 회의주의자</textarea>
+    <div class="row" style="margin-top:4px">
+      <span class="note" style="margin:0">빠른 입력:</span>
+      <button class="chip" data-fill="찬반">찬성/반대 2명</button>
+      <button class="chip" data-fill="삼자">찬성/반대/중립 3명</button>
+      <button class="chip" data-fill="무입장">입장 없이</button>
+    </div>
     <div class="row" style="margin-top:8px">
       <div style="flex:1;min-width:200px">
         <label>Judge (provider/model, 비우면 판정 없음)</label>
@@ -199,7 +211,8 @@ function setMetrics(r){
 function card(p){
   const el = document.createElement('div');
   el.className = 'card';
-  el.innerHTML = `<div class="lab">${p.label}</div><div class="mdl">${p.model}</div>
+  const badge = p.stance ? `<span class="stance">${p.stance}</span>` : '';
+  el.innerHTML = `<div class="lab">${p.label}${badge}</div><div class="mdl">${p.model}</div>
     <div class="state s-idle"><span class="dot"></span><span class="txt">대기</span></div>
     <div class="timer"></div>`;
   $('cards').appendChild(el);
@@ -398,11 +411,45 @@ async function post(url, body){
   return j;
 }
 
+// 프리셋은 provider/model 은 그대로 두고 뒤 두 칸(입장·페르소나)만 바꿉니다.
+// 찬반/삼자는 참가자 수도 맞추고, '입장 없이'는 현재 수를 그대로 둡니다 —
+// 입장을 지우려던 것이 참가자를 늘리면 놀랍니다.
+const PRESETS = {
+  찬반: ['찬성 | 데이터와 측정 방법을 중시하는 실증주의자',
+         '반대 | 조직 문화와 암묵지 전수를 중시하는 현장주의자'],
+  삼자: ['찬성 | 데이터와 측정 방법을 중시하는 실증주의자',
+         '반대 | 조직 문화와 암묵지 전수를 중시하는 현장주의자',
+         '중립 | 비용과 트레이드오프를 따지는 회의주의자'],
+  무입장: null,
+};
+document.querySelectorAll('.chip').forEach(btn => btn.onclick = () => {
+  const heads = $('agents').value.split('\n')
+                  .map(s => s.split('|')[0].trim()).filter(Boolean);
+  if(!heads.length) heads.push('fake/fake-a');
+  const tails = PRESETS[btn.dataset.fill];
+  if(tails === null){                       // 입장만 지우고 참가자 수는 유지
+    $('agents').value = heads.join('\n');
+    return;
+  }
+  $('agents').value = tails.map((tail, i) =>
+    `${heads[i] || heads[heads.length - 1]} | ${tail}`).join('\n');
+});
+
 $('btn-create').onclick = async () => {
   $('setup-msg').textContent = '견적 계산 중…';
   try{
     const agents = $('agents').value.split('\n').map(s=>s.trim()).filter(Boolean)
-      .map(s=>{const i=s.indexOf('/'); return {provider:s.slice(0,i), model:s.slice(i+1)};});
+      .map(line => {
+        // 'provider/model | 입장 | 페르소나'. 구분자가 '|' 인 이유는 모델 ID 에
+        // 콜론이 들어가기 때문입니다 (OpenRouter 의 ':free').
+        const [head, stance, persona] = line.split('|').map(x => x.trim());
+        const i = head.indexOf('/');
+        if(i < 0) throw new Error(`'${head}' — provider/model 형식이 아닙니다`);
+        const p = {provider: head.slice(0, i), model: head.slice(i + 1)};
+        if(stance) p.stance = stance;
+        if(persona) p.persona = persona;
+        return p;
+      });
     const j = await post('/debates', {
       topic:$('topic').value, participants:agents, rounds:+$('rounds').value,
       judge: $('judge').value.trim() || null, use_fake: $('usefake').checked,

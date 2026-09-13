@@ -19,7 +19,9 @@ from pathlib import Path
 
 import yaml
 
-from .agent import Agent, Anonymizer, Moderator, split_provider_model
+from .agent import (
+    Agent, Anonymizer, Moderator, parse_participant_line, split_provider_model,
+)
 from .config import FAKE_PROVIDER, PricingTable, Settings, load_provider_slots
 from .cost import CostMeter, Estimator
 from .context import ContextBuilder
@@ -51,14 +53,21 @@ def _label(i: int) -> str:
 
 
 def _parse_agent_flag(raw: str, index: int, *, fake: bool) -> AgentSpec:
-    """`provider/model` 또는 (fake 모드에서) `model` 을 AgentSpec 으로."""
-    if "/" in raw:
-        provider, _, model = raw.partition("/")
+    """`provider/model [| 입장 [| 페르소나]]` 를 AgentSpec 으로.
+
+    구분자가 '|' 인 이유는 모델 ID 에 콜론이 들어가기 때문입니다
+    (OpenRouter 무료 모델의 `:free` 접미사).
+    """
+    head, stance, persona = parse_participant_line(raw)
+
+    if "/" in head:
+        provider, _, model = head.partition("/")
     elif fake:
-        provider, model = FAKE_PROVIDER, raw
+        provider, model = FAKE_PROVIDER, head
     else:
         raise ConfigError(
-            f"--agent {raw!r}: 'provider/model' 형식으로 쓰세요 (예: openai/gpt-4o-mini). "
+            f"--agent {raw!r}: 'provider/model' 형식으로 쓰세요 "
+            "(예: openai/gpt-4o-mini, 또는 'openai/gpt-4o-mini | 반대 | 회의주의자'). "
             "프로바이더 이름은 .env 의 DEBATE_PROVIDER_*_NAME 입니다."
         )
     provider, model = provider.strip().lower(), model.strip()
@@ -69,7 +78,8 @@ def _parse_agent_flag(raw: str, index: int, *, fake: bool) -> AgentSpec:
         label=_label(index),
         provider=provider,
         model=model,
-        persona=DEFAULT_PERSONA,
+        persona=persona or DEFAULT_PERSONA,
+        stance=stance,
     )
 
 
@@ -605,7 +615,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--topic")
     r.add_argument(
         "--agent", action="append",
-        help="'provider/model' (fake 모드면 'model' 만도 가능). 반복 지정.",
+        help="'provider/model [| 입장 [| 페르소나]]'. 예: "
+             "'openai/gpt-4o-mini | 반대 | 비용을 따지는 회의주의자'. 반복 지정.",
     )
     r.add_argument("--config", help="참가자 로스터 yaml")
     r.add_argument("--rounds", type=int)

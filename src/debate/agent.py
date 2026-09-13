@@ -23,6 +23,29 @@ from .provider import ChatProvider, ProviderError
 #: (2차는 슬라이스 2 의 Anonymizer.scrub). 문체 기반 추정까지는 못 막습니다.
 DEFAULT_PERSONA_FALLBACK = "논리적 근거를 중시하는 토론자"
 
+#: 입장을 지정하지 않았을 때 고를 수 있는 표준 값. 자유 텍스트도 받습니다.
+STANCES = ("찬성", "반대", "중립")
+
+#: 참가자 한 줄의 구분자.
+#:
+#: ':' 이 아니라 '|' 인 이유는 모델 ID 에 콜론이 들어가기 때문입니다 —
+#: OpenRouter 무료 모델이 `...:free` 로 끝납니다. 콜론으로 자르면 모델 ID 가
+#: 잘려나갑니다.
+FIELD_SEP = "|"
+
+
+def parse_participant_line(raw: str) -> tuple[str, str | None, str | None]:
+    """'provider/model | 입장 | 페르소나' 를 나눕니다.
+
+    뒤 두 칸은 선택입니다. 입장을 비우면 프롬프트에 [당신의 입장] 줄이 아예
+    들어가지 않습니다 — 빈 입장을 넣느니 없는 게 낫습니다.
+    """
+    parts = [p.strip() for p in raw.split(FIELD_SEP)]
+    head = parts[0]
+    stance = parts[1] if len(parts) > 1 and parts[1] else None
+    persona = parts[2] if len(parts) > 2 and parts[2] else None
+    return head, stance, persona
+
 
 def split_provider_model(raw: str, default_provider: str) -> tuple[str, str]:
     """'provider/model' 을 **첫 번째 /** 기준으로 나눕니다.

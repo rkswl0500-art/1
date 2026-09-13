@@ -45,7 +45,8 @@ def event_to_dict(event: Any) -> dict:
         return {"type": "debate_started", "debate_id": event.debate_id,
                 "topic": event.topic, "rounds": event.rounds,
                 "participants": [{"id": s.id, "label": s.label, "model": s.model,
-                                  "provider": s.provider} for s in event.participants]}
+                                  "provider": s.provider, "stance": s.stance}
+                                 for s in event.participants]}
     if isinstance(event, RoundStarted):
         return {"type": "round_started", "round_no": event.round_no,
                 "active": list(event.active)}

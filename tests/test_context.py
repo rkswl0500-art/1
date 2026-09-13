@@ -182,3 +182,62 @@ async def test_default_gate_injects_nothing():
     from debate.engine import NoIntervention
 
     assert await NoIntervention().collect(2, DebateState(topic="t")) == ()
+
+
+# ── 입장과 반박 지시 (라이브에서 수렴이 드러남) ─────────────────────────────
+
+
+def test_stance_reaches_the_prompt():
+    """설계에는 있었지만 CLI 플래그·UI 어디에서도 채울 수 없었습니다."""
+    from debate.agent import build_header
+
+    with_stance = build_header(
+        AgentSpec("p1", "참가자 A", "g", "m", "실증주의자", stance="반대"), "주제")
+    assert "[당신의 입장] 반대" in with_stance
+
+    without = build_header(AgentSpec("p1", "참가자 A", "g", "m", "실증주의자"), "주제")
+    assert "[당신의 입장]" not in without    # 빈 입장을 넣느니 없는 게 낫습니다
+
+
+def test_round_two_demands_rebuttal_not_just_a_turn():
+    """'제2라운드 발언을 작성하십시오'뿐이면 직전 라운드 전문이 반박 대상이 아니라
+    **재료**로 읽힙니다. 같은 모델·같은 페르소나면 상대 근거를 그대로 이어받아
+    강화하는 게 자연스러운 이어쓰기이고, 라이브에서 실제로 그렇게 수렴했습니다."""
+    text = _rendered(_builder().build_for(
+        SPECS[0], DebateState(topic="주제", round_no=2)))
+
+    assert "목적은 **반박**" in text
+    assert "그대로 가져다 자기 주장을 강화하지 마십시오" in text
+    assert "반박 없이 새 주장만 덧붙이는 발언" in text
+
+
+def test_round_one_asks_for_a_position_and_a_self_rebuttal():
+    text = _rendered(_builder().build_for(SPECS[0], DebateState(topic="주제")))
+
+    assert "입론" in text
+    assert "당신의 입장을 분명히 밝히고" in text
+    assert "반대편이 제기할 가장 유력한 반론" in text
+    assert "목적은 **반박**" not in text     # R1 은 반박 라운드가 아닙니다
+
+
+def test_agreement_must_be_stated_not_hidden():
+    """동의 자체를 금지하면 억지 반대를 만듭니다. 동의는 허용하되 드러내게 합니다."""
+    text = _rendered(_builder().build_for(
+        SPECS[0], DebateState(topic="주제", round_no=3)))
+
+    assert "동의한다면 동의한다고 **명시**" in text
+    assert "남는 쟁점" in text
+
+
+def test_a_participants_stance_does_not_leak_to_others():
+    """입장은 각자의 헤더에만 들어갑니다. 남의 입장이 보이면 그걸 겨냥해
+    말하게 되고, 라운드 내 블라인드가 무의미해집니다."""
+    from debate.agent import build_header
+
+    a = AgentSpec("p1", "참가자 A", "g", "m1", "실증주의자", stance="찬성")
+    b = AgentSpec("p2", "참가자 B", "o", "m2", "현장주의자", stance="반대")
+
+    header_a = build_header(a, "주제")
+    assert "찬성" in header_a
+    assert "반대" not in header_a
+    assert b.model not in header_a

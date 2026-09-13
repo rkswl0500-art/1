@@ -126,3 +126,24 @@ def test_timeout_warning_fires_on_inconsistent_override(monkeypatch, capsys):
     out = capsys.readouterr().out
 
     assert "라운드 타임아웃 60s < 재시도 예산 360s" in out
+
+
+def test_agent_flag_accepts_stance_and_persona():
+    from debate.cli import _parse_agent_flag
+
+    spec = _parse_agent_flag("openai/gpt-4o-mini | 반대 | 비용을 따지는 회의주의자",
+                             0, fake=False)
+
+    assert (spec.provider, spec.model) == ("openai", "gpt-4o-mini")
+    assert spec.stance == "반대"
+    assert spec.persona == "비용을 따지는 회의주의자"
+    assert spec.label == "참가자 A"
+
+
+def test_agent_flag_without_stance_still_works():
+    from debate.cli import DEFAULT_PERSONA, _parse_agent_flag
+
+    spec = _parse_agent_flag("openai/gpt-4o-mini", 1, fake=False)
+
+    assert spec.stance is None
+    assert spec.persona == DEFAULT_PERSONA

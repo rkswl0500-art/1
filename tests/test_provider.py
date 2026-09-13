@@ -350,3 +350,28 @@ def test_pricing_matches_with_or_without_the_models_prefix():
     assert bare.cost_for("gemini-3.6-flash", Usage(1_000_000, 0))[1] is True
 
     assert bare.cost_for("완전히-다른-모델", Usage(1_000_000, 0))[1] is False
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("gemini/x", ("gemini/x", None, None)),
+    ("gemini/x | 찬성", ("gemini/x", "찬성", None)),
+    ("gemini/x | 반대 | 회의주의자", ("gemini/x", "반대", "회의주의자")),
+    ("gemini/x |  | 실증주의자", ("gemini/x", None, "실증주의자")),
+    ("  gemini/x | 중립  ", ("gemini/x", "중립", None)),
+])
+def test_participant_line_parsing(raw, expected):
+    from debate.agent import parse_participant_line
+
+    assert parse_participant_line(raw) == expected
+
+
+def test_field_separator_survives_colons_in_model_ids():
+    """OpenRouter 무료 모델은 ':free' 로 끝납니다. 콜론으로 자르면 모델 ID 가
+    잘려나가므로 구분자는 '|' 입니다."""
+    from debate.agent import parse_participant_line
+
+    head, stance, persona = parse_participant_line(
+        "openrouter/meta-llama/llama-3.3-70b:free | 반대 | 회의주의자")
+
+    assert head == "openrouter/meta-llama/llama-3.3-70b:free"
+    assert (stance, persona) == ("반대", "회의주의자")
