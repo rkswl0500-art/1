@@ -591,22 +591,31 @@ async function loadModels(prov){
     const r = await fetch(`/models?provider=${encodeURIComponent(prov)}`);
     const j = await r.json();
     if(!r.ok) throw new Error(j.detail || '목록 실패');
-    modelCache[prov] = {models: j.models, error: null};
-  }catch(err){ modelCache[prov] = {models: [], error: err.message}; }
+    modelCache[prov] = {models: j.models, nonChat: j.non_chat || {}, error: null};
+  }catch(err){ modelCache[prov] = {models: [], nonChat: {}, error: err.message}; }
   return modelCache[prov];
 }
 
 function modelField(scope, i, prov, value, free){
-  const c = modelCache[prov] || {models: [], error: '불러오는 중'};
+  const c = modelCache[prov] || {models: [], nonChat: {}, error: '불러오는 중'};
   if(free || !c.models.length){
     const why = c.error ? ` <span class="fail">목록 실패: ${c.error}</span>` : '';
     return `<input data-s="${scope}" data-i="${i}" data-k="model"
               placeholder="모델 ID 직접 입력" value="${value}">${why}`;
   }
-  const opts = c.models.map(m =>
-    `<option${m === value ? ' selected' : ''}>${m}</option>`).join('');
+  // 채팅 불가로 보이는 모델은 **숨기지 않고 아래로 내려** 용도를 붙입니다.
+  // 목록에서 빼면 패턴 표에 없는 새 모델을 못 쓰게 됩니다.
+  const chat = c.models.filter(m => !c.nonChat[m]);
+  const other = c.models.filter(m => c.nonChat[m]);
+  const opt = m => `<option${m === value ? ' selected' : ''}>${m}</option>`;
+  const otherOpt = m =>
+    `<option${m === value ? ' selected' : ''}>${m} — ${c.nonChat[m]}</option>`;
   return `<select data-s="${scope}" data-i="${i}" data-k="model">
-            <option value="">— 모델 선택 —</option>${opts}</select>`;
+            <option value="">— 모델 선택 —</option>
+            ${chat.length ? `<optgroup label="채팅 모델">${chat.map(opt).join('')}</optgroup>` : ''}
+            ${other.length ? `<optgroup label="채팅 불가로 보임 (고르면 실패할 수 있음)">${
+              other.map(otherOpt).join('')}</optgroup>` : ''}
+          </select>`;
 }
 
 function renderRows(){
@@ -651,7 +660,8 @@ function bind(container, scope){
         const v = prompt('입장을 직접 입력하세요', target.stance || '');
         target.stance = v || ''; renderRows(); return;
       }
-      target[k] = el.value;
+      // '모델 — 용도' 로 보여준 항목은 꼬리를 떼고 저장합니다.
+      target[k] = k === 'model' ? el.value.split(' — ')[0] : el.value;
       if(k === 'provider'){ target.model = ''; await loadModels(el.value);
                             scope === 'p' ? renderRows() : renderJudge(); return; }
       if(scope === 'p') refreshStanceHint(); else renderJudge();
@@ -690,9 +700,16 @@ function renderJudge(){
 
 // 벤더가 겹치는지는 **고르는 시점에** 보여줍니다. 실행이 끝난 뒤에 알면
 // 이미 그 점수로 채점이 끝난 뒤입니다.
+function nonChatNote(prov, model){
+  const r = (modelCache[prov] || {}).nonChat || {};
+  return r[model] ? `이 모델은 <strong>${r[model]}</strong> 용도로 보입니다 — 채팅을 지원하지 않으면 실패합니다.` : '';
+}
+
 function renderFamily(){
   const el = $('j-family');
   if(!judgeSel.model){ el.textContent = ''; return; }
+  const warn = nonChatNote(judgeSel.provider, judgeSel.model);
+  if(warn){ el.innerHTML = `<span class="fail">${warn}</span>`; return; }
   const jv = vendorOf(judgeSel.model);
   const pv = [...new Set(currentRows().filter(r=>r.model).map(r=>vendorOf(r.model)))];
   if(!pv.length){ el.textContent = ''; return; }

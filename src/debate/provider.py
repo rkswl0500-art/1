@@ -31,6 +31,40 @@ from .models import (
     RUBRIC_KEYS, AgentSpec, ChatRequest, ChatResponse, ConfigError, Usage,
 )
 
+# ── 모델 용도 추정 ───────────────────────────────────────────────────────────
+
+#: 채팅이 아닌 것이 거의 확실한 모델 패턴. (패턴, 사람이 읽을 용도)
+#:
+#: 프로바이더의 /models 는 용도를 알려주지 않습니다. Groq 만 해도 음성인식·음성합성·
+#: 프롬프트 필터·안전성 분류를 채팅 모델과 한 목록에 섞어 돌려줍니다. 실제로
+#: whisper 를 심판으로 골라 400 "does not support chat completions" 를 받았습니다.
+#:
+#: **숨기지 않고 분류만 합니다.** 목록에서 빼버리면 이 표에 없는 새 모델이 나왔을
+#: 때 쓸 수 없게 되고, 프로바이더는 새 모델을 계속 냅니다. 모르는 모델은 채팅으로
+#: 간주하는 쪽이 안전한 기본값입니다 — 틀려도 400 한 번이면 드러납니다.
+NON_CHAT_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("whisper", "음성 인식"),
+    ("transcrib", "음성 인식"),
+    ("orpheus", "음성 합성"),
+    ("playai", "음성 합성"),
+    ("-tts", "음성 합성"),
+    ("tts-", "음성 합성"),
+    ("embed", "임베딩"),
+    ("rerank", "재순위"),
+    ("guard", "안전성 분류·프롬프트 필터"),
+    ("moderat", "안전성 분류"),
+)
+
+
+def looks_non_chat(model_id: str) -> str | None:
+    """채팅 불가로 **보이는** 이유. 확신이 아니라 힌트입니다."""
+    name = model_id.lower()
+    for pattern, purpose in NON_CHAT_PATTERNS:
+        if pattern in name:
+            return purpose
+    return None
+
+
 # ── 에러 ─────────────────────────────────────────────────────────────────────
 
 

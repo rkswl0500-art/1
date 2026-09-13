@@ -218,3 +218,15 @@ def test_masking(key, expected):
 def test_presets_cover_the_providers_we_documented(client):  # noqa: D103
     names = {p["name"] for p in client.get("/config/providers").json()["presets"]}
     assert names == {"gemini", "groq", "openrouter"}
+
+
+def test_models_endpoint_classifies_without_hiding(client):
+    """숨기지 않고 분류만 합니다 — 목록에서 빼면 패턴 표에 없는 새 모델을
+    못 쓰게 됩니다."""
+    j = client.get("/models?provider=fake").json()
+
+    assert set(j) == {"provider", "models", "non_chat"}
+    assert j["models"]                      # 전부 그대로 들어 있음
+    assert isinstance(j["non_chat"], dict)
+    for flagged in j["non_chat"]:
+        assert flagged in j["models"]       # 분류된 것도 목록에 남아 있어야 합니다

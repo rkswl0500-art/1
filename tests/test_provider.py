@@ -375,3 +375,43 @@ def test_field_separator_survives_colons_in_model_ids():
 
     assert head == "openrouter/meta-llama/llama-3.3-70b:free"
     assert (stance, persona) == ("반대", "회의주의자")
+
+
+# ── 채팅 불가 모델 분류 (라이브에서 whisper 를 심판으로 골라 400) ───────────
+
+
+@pytest.mark.parametrize("model,purpose", [
+    ("whisper-large-v3-turbo", "음성 인식"),
+    ("distil-whisper-large-v3-en", "음성 인식"),
+    ("playai-tts", "음성 합성"),
+    ("orpheus-3b-0.1-ft", "음성 합성"),
+    ("llama-prompt-guard-2-86m", "안전성 분류·프롬프트 필터"),
+    ("openai/gpt-oss-safeguard-20b", "안전성 분류·프롬프트 필터"),
+    ("text-embedding-3-large", "임베딩"),
+])
+def test_non_chat_models_are_flagged(model, purpose):
+    from debate.provider import looks_non_chat
+
+    assert looks_non_chat(model) == purpose
+
+
+@pytest.mark.parametrize("model", [
+    "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile",
+    "models/gemini-3.8-flash", "gemini-3.5-flash-lite", "gpt-4o-mini",
+    "claude-sonnet-5",
+])
+def test_real_chat_models_are_not_flagged(model):
+    """모르는 모델은 채팅으로 간주합니다. 반대로 하면 표에 없는 새 모델을
+    못 쓰게 되고, 프로바이더는 새 모델을 계속 냅니다."""
+    from debate.provider import looks_non_chat
+
+    assert looks_non_chat(model) is None
+
+
+def test_gpt_oss_120b_and_safeguard_are_distinguished():
+    """이름이 비슷해도 용도가 다릅니다. 접두사가 같다고 뭉뚱그리면 정상 모델이
+    막힙니다."""
+    from debate.provider import looks_non_chat
+
+    assert looks_non_chat("openai/gpt-oss-120b") is None
+    assert looks_non_chat("openai/gpt-oss-safeguard-20b") is not None

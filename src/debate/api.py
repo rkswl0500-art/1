@@ -27,7 +27,7 @@ from .cost import CostMeter, Estimator
 from .judge import family_note, vendor_family
 from .envfile import SlotInput, mask_key, save_slots
 from .models import AgentSpec, ConfigError
-from .provider import FakeProvider, build_pool
+from .provider import FakeProvider, build_pool, looks_non_chat
 from .session import (
     DEFAULT_GATE_TIMEOUT_S, DebateSession, HttpGate, new_debate_id,
 )
@@ -239,8 +239,13 @@ async def index() -> FileResponse:
 @app.get("/models")
 async def models(provider: str = FAKE_PROVIDER) -> dict:
     """모델 ID 목록. base_url·키는 응답에 넣지 않습니다."""
+    def annotate(models: list[str]) -> dict:
+        # 숨기지 않고 표시만 합니다. 목록에서 빼면 표에 없는 새 모델을 못 씁니다.
+        return {"provider": provider, "models": models,
+                "non_chat": {m: r for m in models if (r := looks_non_chat(m))}}
+
     if provider == FAKE_PROVIDER:
-        return {"provider": provider, "models": await FakeProvider().list_models()}
+        return annotate(await FakeProvider().list_models())
     registry = provider_registry()
     if provider not in registry:
         raise HTTPException(400, f"프로바이더 {provider!r} 없음. "
@@ -250,7 +255,7 @@ async def models(provider: str = FAKE_PROVIDER) -> dict:
     p = OpenAICompatProvider(registry.get(provider),
                              timeout_s=Settings().request_timeout_s)
     try:
-        return {"provider": provider, "models": await p.list_models()}
+        return annotate(await p.list_models())
     finally:
         await p.aclose()
 

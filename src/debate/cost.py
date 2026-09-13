@@ -198,13 +198,19 @@ class Estimator:
         per_model_hi: dict[str, Decimal] = {}
         tok_lo = tok_hi = calls = 0
 
-        def add(model: str, in_tok: int, out_lo: int, out_hi: int) -> None:
+        def add(model: str, in_lo: int, in_hi: int, out_lo: int, out_hi: int) -> None:
+            """입력도 저/고를 따로 받습니다.
+
+            입력에 단일 값을 쓰면 저 추정에도 **직전 라운드가 최대로 길었을 때**의
+            크기가 들어가, 하한이 하한이 아니게 됩니다. 3라운드 실측(7,307)이
+            하한(7,713) 아래로 떨어진 원인이 이것이었습니다.
+            """
             nonlocal tok_lo, tok_hi, calls
             calls += 1
-            tok_lo += in_tok + out_lo
-            tok_hi += in_tok + out_hi
-            lo, _ = self._pricing.cost_for(model, Usage(in_tok, out_lo))
-            hi, _ = self._pricing.cost_for(model, Usage(in_tok, out_hi))
+            tok_lo += in_lo + out_lo
+            tok_hi += in_hi + out_hi
+            lo, _ = self._pricing.cost_for(model, Usage(in_lo, out_lo))
+            hi, _ = self._pricing.cost_for(model, Usage(in_hi, out_hi))
             per_model_lo[model] = per_model_lo.get(model, Decimal(0)) + lo
             per_model_hi[model] = per_model_hi.get(model, Decimal(0)) + hi
 
@@ -220,13 +226,16 @@ class Estimator:
         for round_no in range(1, rounds + 1):
             rebuttal = round_no > 1
             out_lo, out_hi = _OUT_CHARS_REBUTTAL if rebuttal else _OUT_CHARS_R1
-            # 직전 라운드 전문은 (참가자 수 - 1) 명분이 들어갑니다.
-            prev_hi = _OUT_CHARS_R1[1] if round_no == 2 else _OUT_CHARS_REBUTTAL[1]
-            prev_chars = 0 if not rebuttal else (n - 1) * prev_hi
+            # 직전 라운드 전문은 (참가자 수 - 1) 명분이 들어갑니다. 저/고를
+            # 각각 직전 라운드의 저/고 출력으로 잡습니다.
+            prev = _OUT_CHARS_R1 if round_no == 2 else _OUT_CHARS_REBUTTAL
+            prev_lo = 0 if not rebuttal else (n - 1) * prev[0]
+            prev_hi = 0 if not rebuttal else (n - 1) * prev[1]
             extras = 0 if not rebuttal else _ISSUES_CHARS + _DIGEST_CHARS
             for spec in participants:
+                base = header_chars[spec.model] + extras
                 add(spec.model,
-                    self._tok(header_chars[spec.model] + prev_chars + extras),
+                    self._tok(base + prev_lo), self._tok(base + prev_hi),
                     self._tok(out_lo), self._tok(out_hi))
             transcript_lo.append(n * out_lo)
             transcript_hi.append(n * out_hi)
@@ -234,10 +243,12 @@ class Estimator:
         mod = moderator_model or (participants[0].model if participants else None)
         if mod and rounds >= 1:
             # 쟁점 추출 1회 + 요약 (rounds - 2) 회
-            add(mod, self._tok(n * _OUT_CHARS_R1[1]),
+            add(mod, self._tok(n * _OUT_CHARS_R1[0]), self._tok(n * _OUT_CHARS_R1[1]),
                 self._tok(100), self._tok(_ISSUES_CHARS))
             for _ in range(max(0, rounds - 2)):
-                add(mod, self._tok(n * _OUT_CHARS_REBUTTAL[1] + _DIGEST_CHARS),
+                add(mod,
+                    self._tok(n * _OUT_CHARS_REBUTTAL[0] + _DIGEST_CHARS),
+                    self._tok(n * _OUT_CHARS_REBUTTAL[1] + _DIGEST_CHARS),
                     self._tok(150), self._tok(_DIGEST_CHARS))
 
         repair_tokens, repair_usd = 0, Decimal(0)
@@ -248,7 +259,9 @@ class Estimator:
             # 예산을 잡을 때 쓰는 함수를 그대로 씁니다 — 따로 추정하면 한쪽만
             # 갱신되어 어긋납니다(실제로 견적 쪽이 쟁점 수를 무시하고 있었습니다).
             content = verdict_content_tokens(issue_count, n)
-            add(judge_model, self._tok(sum(transcript_hi) + _ISSUES_CHARS),
+            add(judge_model,
+                self._tok(sum(transcript_lo) + _ISSUES_CHARS),
+                self._tok(sum(transcript_hi) + _ISSUES_CHARS),
                 content // 2, content)
             # 복구 호출은 같은 프롬프트를 다시 보내는 것이라 한 번 더 친 것과
             # 비슷합니다. 본 범위가 아니라 별도 항목으로 냅니다.

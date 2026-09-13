@@ -36,7 +36,9 @@ from .models import (
     IssuesExtracted, RoundStarted, RoundSummarized, UtteranceCompleted,
     UtteranceStarted,
 )
-from .provider import FakeBehavior, FakeProvider, ProviderError, build_pool
+from .provider import (
+    FakeBehavior, FakeProvider, ProviderError, build_pool, looks_non_chat,
+)
 
 DEFAULT_PERSONA = "논리적 근거를 중시하는 토론자"
 
@@ -426,9 +428,13 @@ def _print_diagnosis(result: DebateResult, rep) -> None:
 async def _cmd_models(args: argparse.Namespace) -> int:
     settings = Settings()
     name = args.provider.lower()
+    def show(models: list[str]) -> None:
+        for m in models:
+            reason = looks_non_chat(m)
+            print(f"{m}    ← {reason} (채팅 불가로 보임)" if reason else m)
+
     if name == FAKE_PROVIDER:
-        for m in await FakeProvider().list_models():
-            print(m)
+        show(await FakeProvider().list_models())
         return 0
 
     registry = provider_registry(settings)
@@ -442,8 +448,7 @@ async def _cmd_models(args: argparse.Namespace) -> int:
         registry.get(name), timeout_s=settings.request_timeout_s
     )
     try:
-        for m in await provider.list_models():
-            print(m)
+        show(await provider.list_models())
     finally:
         await provider.aclose()
     return 0
