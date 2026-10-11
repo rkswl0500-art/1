@@ -54,8 +54,19 @@ class CreateDebate(BaseModel):
     #: fake 모드 전용. {모델: 지연ms}. 느린 참가자를 기다리는 화면을 재현하려면
     #: 실제 지연 편차가 필요합니다 (관측: 54.3s vs 1.8s).
     fake_latency_ms: dict[str, int] | None = None
-    #: 0 이면 라운드 사이에 사람을 기다리지 않습니다.
-    gate_timeout_s: float = Field(default=0.0, ge=0, le=1800)
+    #: 라운드 사이에 사람 지시를 기다리는 시간. **0 이면 아예 기다리지 않습니다**
+    #: (무한 대기가 아닙니다 — `HttpGate.collect` 는 `timeout_s <= 0` 이면 즉시
+    #: 반환하고, 그 외에는 `asyncio.wait_for` 로 끊습니다. 무한 대기 경로는 없습니다).
+    #:
+    #: 기본값을 0 → 300 으로 올린 것은 타임아웃을 **도입**한 게 아니라 게이트를
+    #: 기본으로 **켠** 것입니다. 여러 기기에서 붙는 구성에서는 폰에서 라운드 사이에
+    #: 끼어들 수 있어야 하고, 그게 이 프로젝트에서 다기기의 주 용도이기 때문입니다.
+    #:
+    #: 대가: 지시를 넣지 않는 비대화형 호출자(스크립트)는 이제 라운드 경계마다
+    #: 최대 300s 를 그냥 기다립니다. 그런 호출자는 `gate_timeout_s: 0` 을
+    #: 명시해야 합니다. UI 는 항상 자기 값을 보내므로(`gatesec`, 기본 120) 영향받지
+    #: 않습니다.
+    gate_timeout_s: float = Field(default=300.0, ge=0, le=1800)
 
 
 class DirectiveIn(BaseModel):

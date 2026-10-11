@@ -688,6 +688,47 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     return 0 if result.status == "completed" else 1
 
 
+def _cmd_serve(args) -> int:
+    """API 서버를 띄웁니다. `DEBATE_HOST` / `DEBATE_PORT` 를 읽는 유일한 경로입니다.
+
+    `python -m uvicorn debate.api:app` 로 직접 띄우면 uvicorn 은 `DEBATE_HOST` 를
+    모릅니다. 그래서 설정만 추가하면 아무 효과가 없어, 그 값을 실제로 쓰는
+    진입점을 같이 둡니다.
+
+    워커는 1 로 고정합니다. 진행 중 토론은 `api._SESSIONS` (모듈 레벨 dict) 에만
+    있어서, 워커가 2 개 이상이면 토론을 시작한 워커가 아닌 쪽에 `/stream` 이
+    붙는 순간 404 가 납니다. 선택지로 두면 조용히 깨지는 구성이므로 막습니다.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        print('uvicorn 이 없습니다. pip install -e ".[api]"', file=sys.stderr)
+        return 2
+
+    settings = Settings()
+    host = args.host or settings.host
+    port = args.port or settings.port
+    loopback = host in {"127.0.0.1", "::1", "localhost"}
+
+    print(f"bind {host}:{port} | workers=1 | config_ui={settings.config_ui}")
+    if loopback:
+        print("  루프백 바인드입니다 — 다른 기기에서는 붙지 않습니다 "
+              "(DEBATE_HOST=0.0.0.0 또는 tailscale serve).")
+    else:
+        # 요청만 보고는 바인드 주소를 알 수 없지만(api._require_local 참고),
+        # 여기서는 우리가 바인드하는 쪽이라 확실히 압니다. 유일하게 이 사실을
+        # 말할 수 있는 지점이므로 말합니다.
+        print(f"  루프백이 아닌 주소에 바인드합니다. {host} 에 닿을 수 있는 "
+              "모든 기기가 토론을 시작할 수 있습니다 — 당신의 쿼터로.")
+        if settings.config_ui.lower() == "local":
+            print("  경고: DEBATE_CONFIG_UI 가 아직 'local' 입니다. 설정 화면은 "
+                  "루프백 클라이언트만 받으므로 키가 새지는 않지만, 다기기 "
+                  "구성에서는 'off' 로 두십시오.", file=sys.stderr)
+
+    uvicorn.run("debate.api:app", host=host, port=port, workers=1)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="debate", description="AI Debate Room")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -735,6 +776,11 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--allow-judge-overlap", action="store_true")
     e.add_argument("--provider-override", choices=[FAKE_PROVIDER])
     e.set_defaults(fn=_cmd_estimate)
+
+    sv = sub.add_parser("serve", help="API 서버 (DEBATE_HOST/PORT 를 읽습니다)")
+    sv.add_argument("--host", help="DEBATE_HOST 보다 우선")
+    sv.add_argument("--port", type=int, help="DEBATE_PORT 보다 우선")
+    sv.set_defaults(fn=_cmd_serve, sync=True)
 
     cal = sub.add_parser("calibrate",
                          help="기록된 실사용량을 견적 모델과 비교 (벤더별 비교 포함)")

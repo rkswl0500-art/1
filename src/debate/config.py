@@ -105,7 +105,20 @@ class Settings(BaseSettings):
     #: 이 엔드포인트는 .env 를 쓰고 키를 다룹니다. 여러 기기에서 접근하는 구성으로
     #: 옮길 때는 반드시 "off" 로 두십시오.
     config_ui: str = "local"
+    #: 서버 바인드 주소. 기본은 루프백이라 **같은 컴퓨터에서만** 열립니다.
+    #:
+    #: 다른 기기(폰 등)에서 붙으려면 `DEBATE_HOST=0.0.0.0` 이나 tailscale IP 로
+    #: 바꿔야 합니다. 루프백에 묶인 서버는 터널을 깔아도 보이지 않습니다.
+    #:
+    #: **이 값을 읽는 건 `python -m debate.cli serve` 뿐입니다.** `python -m uvicorn`
+    #: 으로 직접 띄우면 uvicorn 은 이 변수를 모르므로 `--host` 를 직접 줘야 합니다.
+    host: str = "127.0.0.1"
+    port: int = 8000
     env_path: Path = Path(".env")
+
+    @property
+    def host_is_loopback(self) -> bool:
+        return self.host in {"127.0.0.1", "::1", "localhost"}
 
     @property
     def retry_budget_s(self) -> float:

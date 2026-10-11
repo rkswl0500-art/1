@@ -230,3 +230,49 @@ def test_models_endpoint_classifies_without_hiding(client):
     assert isinstance(j["non_chat"], dict)
     for flagged in j["non_chat"]:
         assert flagged in j["models"]       # 분류된 것도 목록에 남아 있어야 합니다
+
+
+# ── 다기기 모드(1단계: Tailscale) 설정 ──────────────────────────────────────
+
+def test_bind_address_defaults_to_loopback():
+    """기본값이 루프백이어야 합니다. 이 기본값이 흘러서 0.0.0.0 이 되면,
+    서버를 띄운 사람이 모르는 채로 외부에 열립니다."""
+    s = api.Settings()
+    assert s.host == "127.0.0.1"
+    assert s.port == 8000
+    assert s.host_is_loopback
+
+
+def test_bind_address_comes_from_env(monkeypatch):
+    """DEBATE_HOST 로 바꿀 수 있어야 합니다 — 안 그러면 폰에서 못 붙습니다.
+
+    실측(lsof): DEBATE_HOST=127.0.0.1 은 `127.0.0.1:8111 (LISTEN)`,
+    DEBATE_HOST=0.0.0.0 은 `*:8112 (LISTEN)`. 인터페이스 주소 192.0.2.2 로
+    접속하면 전자는 ConnectionRefusedError, 후자는 연결됩니다.
+    """
+    monkeypatch.setenv("DEBATE_HOST", "0.0.0.0")
+    monkeypatch.setenv("DEBATE_PORT", "9001")
+    s = api.Settings()
+    assert (s.host, s.port) == ("0.0.0.0", 9001)
+    assert not s.host_is_loopback
+
+
+@pytest.mark.parametrize("host,loopback", [
+    ("127.0.0.1", True), ("localhost", True), ("::1", True),
+    ("0.0.0.0", False), ("100.101.102.103", False),   # tailscale CGNAT 대역
+])
+def test_loopback_classification(host, loopback):
+    assert api.Settings(host=host).host_is_loopback is loopback
+
+
+def test_gate_is_on_by_default():
+    """게이트 기본값. 0 이면 라운드 사이에 사람이 끼어들 틈이 아예 없습니다.
+
+    다기기의 주 용도가 '폰에서 라운드 사이에 지시를 넣는 것'이라 기본으로
+    켭니다. 0 은 무한 대기가 아니라 '대기 없음'입니다(HttpGate.collect).
+    """
+    body = api.CreateDebate(topic="t", participants=[
+        api.Participant(provider="fake", model="fake-a"),
+        api.Participant(provider="fake", model="fake-b"),
+    ])
+    assert body.gate_timeout_s == 300.0
