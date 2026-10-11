@@ -16,7 +16,7 @@ from typing import Mapping
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import ConfigError, Usage
@@ -31,11 +31,23 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 FAKE_PROVIDER = "fake"
 
 
+#: 슬롯별 `reasoning_effort` 전송 정책.
+#:
+#:   auto  알려진 지원 모델에만 보냅니다(provider.supports_reasoning_effort).
+#:   on    모델과 무관하게 항상 보냅니다 — 패턴 표에 없는 새 모델용.
+#:   off   보내지 않습니다 — 모델 기본 사고 수준을 씁니다.
+#:
+#: 기본이 auto 인 이유: 미지원 모델에 보내면 Groq 는 400 을 냅니다(문서상
+#: 범위 밖 값은 400). 모르는 모델에는 안 보내는 쪽이 안전합니다.
+REASONING_POLICIES = ("auto", "on", "off")
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderSlot:
     name: str
     base_url: str
     api_key: SecretStr | None
+    reasoning: str = "auto"
 
     @property
     def has_key(self) -> bool:
@@ -100,6 +112,30 @@ class Settings(BaseSettings):
     judge_timeout_s: float = 300.0
     #: 0 이면 쟁점·참가자 수에 맞춰 자동 계산합니다(judge.required_output_tokens).
     judge_max_tokens: int = 0
+    #: 심판 호출의 `reasoning_effort`. 빈 값이면 보내지 않고 모델 기본값을 씁니다.
+    #:
+    #: 기본이 low 인 이유 — 실측: gemini-3-flash-preview 심판의 1차 호출 8건 중
+    #: 4건이 잘렸고, 잘린 호출의 본문은 평균 271tok / 예산 7,710tok 였습니다.
+    #: 예산의 96% 를 응답에 안 보이는 사고 토큰이 먹었습니다. 예산을 2배로 늘린
+    #: 복구 호출 1건도 같은 이유로 잘려 판정이 실패했습니다. 이 모델의 기본 사고
+    #: 수준은 high 로 문서화돼 있습니다.
+    #:
+    #: low 를 고른 건 Gemini(2.5/3)와 Groq gpt-oss 가 **공통으로** 받는 값이라서
+    #: 입니다. minimal 과 medium 은 일부 Gemini 3 버전에서 거부됐다는 보고가
+    #: 있고, gpt-oss 는 low/medium/high 만 받습니다.
+    judge_reasoning_effort: str = "low"
+
+    @field_validator("judge_reasoning_effort")
+    @classmethod
+    def _known_effort(cls, v: str) -> str:
+        # 오타(lowe 등)를 그대로 보내면 서버가 400 을 내고 프로바이더가 low 로
+        # 물러서서 **조용히** 다른 값으로 돕니다. 설정 단계에서 막습니다.
+        v = (v or "").strip().lower()
+        allowed = ("", "minimal", "low", "medium", "high")
+        if v not in allowed:
+            raise ValueError(f"DEBATE_JUDGE_REASONING_EFFORT 는 {', '.join(a or '빈값' for a in allowed)} "
+                             f"중 하나여야 합니다: {v!r}")
+        return v
     #: 프로바이더 설정 UI. "local" 이면 루프백 클라이언트만, "off" 면 완전 차단.
     #:
     #: 이 엔드포인트는 .env 를 쓰고 키를 다룹니다. 여러 기기에서 접근하는 구성으로
@@ -225,6 +261,7 @@ def load_provider_slots(
         name = (merged.get(f"DEBATE_PROVIDER_{n}_NAME") or "").strip().lower()
         base_url = (merged.get(f"DEBATE_PROVIDER_{n}_BASE_URL") or "").strip()
         raw_key = (merged.get(f"DEBATE_PROVIDER_{n}_API_KEY") or "").strip()
+        reasoning = (merged.get(f"DEBATE_PROVIDER_{n}_REASONING") or "auto").strip().lower()
 
         if not name and not base_url:
             continue
@@ -244,10 +281,16 @@ def load_provider_slots(
         if not base_url.startswith(("http://", "https://")):
             raise ConfigError(f"프로바이더 {name!r}: BASE_URL 은 http(s):// 로 시작해야 합니다")
 
+        if reasoning not in REASONING_POLICIES:
+            raise ConfigError(
+                f"프로바이더 {name!r}: REASONING 은 {'/'.join(REASONING_POLICIES)} 중 "
+                f"하나여야 합니다: {reasoning!r}")
+
         slots[name] = ProviderSlot(
             name=name,
             base_url=base_url.rstrip("/"),
             api_key=SecretStr(raw_key) if raw_key else None,
+            reasoning=reasoning,
         )
 
     return ProviderRegistry(slots=slots, env_file=resolved, env_file_found=found)

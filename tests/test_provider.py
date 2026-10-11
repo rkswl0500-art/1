@@ -463,3 +463,101 @@ def test_real_for_without_registry_fails_before_any_call():
                    fake=FakeProvider(), real_for={"groq"})
 
     assert "groq" in str(e.value)
+
+
+# ── reasoning_effort ────────────────────────────────────────────────────────
+
+def _effort_provider(handler, policy="auto") -> OpenAICompatProvider:
+    slot = ProviderSlot("t", "https://x.test/v1", SecretStr("k"), reasoning=policy)
+    return OpenAICompatProvider(slot, transport=httpx.MockTransport(handler))
+
+
+def _ok(request_body: dict, sent: list) -> httpx.Response:
+    sent.append(request_body.get("reasoning_effort", "<없음>"))
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": "답"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+
+def _req(model: str, effort: str | None = "low") -> ChatRequest:
+    return ChatRequest(model=model, messages=(Message("user", "q"),),
+                       reasoning_effort=effort)
+
+
+@pytest.mark.parametrize("model,policy,expected", [
+    ("models/gemini-3-flash-preview", "auto", "low"),   # 문서로 확인한 계열
+    ("openai/gpt-oss-120b",           "auto", "low"),
+    ("llama-3.3-70b-versatile",       "auto", "<없음>"),  # 모르는 모델엔 안 보냄
+    ("llama-3.3-70b-versatile",       "on",   "low"),    # 새 모델은 on 으로
+    ("models/gemini-3-flash-preview", "off",  "<없음>"),  # 모델 기본값
+])
+async def test_effort_is_sent_only_where_the_slot_policy_allows(model, policy, expected):
+    """Groq 는 미지원 값에 400 을 냅니다. 모르는 모델에 보내면 판정 단계에서
+    토론 전체가 날아갈 수 있어서, auto 는 확인된 계열에만 보냅니다."""
+    sent: list = []
+    p = _effort_provider(lambda r: _ok(json.loads(r.content), sent), policy)
+
+    resp = await p.chat(_req(model))
+
+    assert sent == [expected]
+    assert resp.reasoning_effort == (None if expected == "<없음>" else expected)
+
+
+async def test_no_effort_requested_means_no_field():
+    sent: list = []
+    p = _effort_provider(lambda r: _ok(json.loads(r.content), sent), "on")
+    await p.chat(_req("models/gemini-3-flash-preview", effort=None))
+    assert sent == ["<없음>"]
+
+
+async def test_rejected_effort_falls_back_to_low_then_records_it():
+    """문서상 Gemini 3 일부 버전이 medium 을 400 으로 거부했습니다. 판정 단계에서
+    400 으로 죽으면 토론이 날아가므로 한 번 물러서고, 그 사실을 남깁니다."""
+    sent: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("reasoning_effort") == "medium":
+            sent.append("medium")
+            return httpx.Response(400, json={"error": {
+                "message": "Thinking level MEDIUM is not supported for this model."}})
+        return _ok(body, sent)
+
+    resp = await _effort_provider(handler).chat(
+        _req("models/gemini-3-flash-preview", effort="medium"))
+
+    assert sent == ["medium", "low"]
+    assert resp.reasoning_effort == "low"            # 원장에는 실제 적용값
+    assert resp.reasoning_note == "medium 거부 → low"
+
+
+async def test_rejected_low_drops_the_field_instead_of_dying():
+    sent: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "reasoning_effort" in body:
+            sent.append(body["reasoning_effort"])
+            return httpx.Response(400, json={"error": {
+                "message": "`reasoning_effort` is not supported with this model"}})
+        return _ok(body, sent)
+
+    resp = await _effort_provider(handler, "on").chat(_req("some-new-model"))
+
+    assert sent == ["low", "<없음>"]
+    assert resp.reasoning_effort is None
+    assert "보내지 않음" in resp.reasoning_note
+
+
+async def test_unrelated_400_is_not_swallowed():
+    """사고 수준과 무관한 400(잘못된 모델 등)은 원래대로 FatalError 여야 합니다.
+    여기서 삼키면 설정 오류가 재시도 뒤에 숨습니다."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(400, json={"error": {"message": "model not found"}})
+
+    with pytest.raises(FatalError):
+        await _effort_provider(handler).chat(_req("models/gemini-3-flash-preview"))
+    assert calls["n"] == 1

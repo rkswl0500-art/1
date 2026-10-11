@@ -291,6 +291,12 @@ function cfgRender(){
           <input data-i="${i}" data-k="api_key" type="password"
                  placeholder="${s.has_key ? '변경할 때만 입력' : '키 붙여넣기'}"
                  value="${s.api_key}"></div>
+        <div class="f"><label title="심판 호출에 reasoning_effort 를 실어 보낼지">사고 수준 전송</label>
+          <select data-i="${i}" data-k="reasoning">
+            ${[['auto','자동 (지원 모델만)'],['on','항상'],['off','안 함 (모델 기본값)']]
+              .map(([v,t])=>`<option value="${v}" ${(s.reasoning||'auto')===v?'selected':''}>${t}</option>`)
+              .join('')}
+          </select></div>
         <button class="chip" data-test="${i}">연결 테스트</button>
         <button class="chip" data-del="${i}">삭제</button>
       </div>
@@ -299,6 +305,9 @@ function cfgRender(){
 
   $('cfg-slots').querySelectorAll('input').forEach(inp => inp.oninput = () => {
     cfgSlots[+inp.dataset.i][inp.dataset.k] = inp.value;
+  });
+  $('cfg-slots').querySelectorAll('select[data-k]').forEach(sel => sel.onchange = () => {
+    cfgSlots[+sel.dataset.i][sel.dataset.k] = sel.value;
   });
   $('cfg-slots').querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
     cfgSlots.splice(+b.dataset.del, 1); cfgRender();
@@ -334,7 +343,8 @@ $('cfg-save') && ($('cfg-save').onclick = async () => {
     const r = await fetch('/config/providers', {
       method:'PUT', headers:{'content-type':'application/json'},
       body: JSON.stringify({slots: cfgSlots.map(s =>
-        ({name:s.name, base_url:s.base_url, api_key:s.api_key}))}),
+        ({name:s.name, base_url:s.base_url, api_key:s.api_key,
+          reasoning:s.reasoning || 'auto'}))}),
     });
     const j = await r.json();
     if(!r.ok) throw new Error(j.detail || '저장 실패');
@@ -550,8 +560,15 @@ function showVerdict(v){
     const lost = v.first_budget && v.first_output_tokens
       ? ` (1차: 본문 ${v.first_output_tokens.toLocaleString()}tok / 예산 ${v.first_budget.toLocaleString()}tok`
         + ` — 차액은 응답에 안 보이는 사고 토큰으로 보입니다)` : '';
+    const stepped = v.repair_reasoning_effort && v.repair_reasoning_effort !== v.reasoning_effort
+      ? ` 사고 수준을 ${v.reasoning_effort} → ${v.repair_reasoning_effort} 로 낮췄습니다.` : '';
     repairNote = `<div class="warn">1차 판정이 길이 제한에 걸려 <b>더 짧게 다시 받았습니다</b>.`
-      + ` 점수는 유효하지만 이 심판이 평소 쓰는 길이는 아닙니다${lost}.</div>`;
+      + ` 점수는 유효하지만 이 심판이 평소 쓰는 길이는 아닙니다${lost}.${stepped}</div>`;
+  }
+  // 요청한 사고 수준을 서버가 거부해 바꿔 보낸 경우. 판정은 유효하지만
+  // 설정과 다른 수준으로 돌았다는 사실은 알려야 합니다.
+  if(v.reasoning_note){
+    repairNote += `<div class="note">사고 수준: ${v.reasoning_note}</div>`;
   }
   const labels = Object.keys(v.totals).sort();
   // 축 이름을 하드코딩하지 않습니다 — 서버 루브릭이 바뀌면 표가 조용히
@@ -574,7 +591,8 @@ function showVerdict(v){
     // 사용자가 결론만 읽고 틀린 숫자를 믿는 걸 막는 게 목적입니다.
     h += `<div class="note"><span class="fail">⚠ ${msg}</span><br>위 표의 점수가 정확합니다.</div>`;
   });
-  h += `<div class="note">judge: ${v.judge_model} · 프롬프트 ${n(v.prompt_tokens)}tok`+
+  h += `<div class="note">judge: ${v.judge_model} · 사고 수준 ${v.reasoning_effort || '모델 기본값'}`+
+    ` · 프롬프트 ${n(v.prompt_tokens)}tok`+
        (v.truncated?' · ⚠ 판정이 잘렸습니다':'')+`</div>`;
   $('verdict').innerHTML = h;
 }

@@ -41,6 +41,9 @@ class ChatRequest:
     purpose: CallPurpose = "debate"
     #: 몇 번째 라운드의 호출인지. 원장 조회와 fake 장애 주입에 씁니다.
     round_no: int | None = None
+    #: 요청하는 사고 수준(low 등). None 이면 보내지 않습니다. 실제로 보낼지는
+    #: 슬롯 정책과 모델이 정합니다(provider.OpenAICompatProvider).
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +67,12 @@ class ChatResponse:
     finish_reason: str | None = None
     #: 성공까지 걸린 시도 횟수. 1 이면 첫 시도에 성공.
     attempts: int = 1
+    #: **실제로 적용된** 사고 수준. 요청과 다를 수 있습니다 — 슬롯 정책이 막았거나
+    #: (None), 서버가 그 값을 거부해 낮춰 보냈거나. 원장에 이 값을 남겨야
+    #: low 로 돈 판정과 모델 기본값으로 돈 판정이 한 평균에 섞이지 않습니다.
+    reasoning_effort: str | None = None
+    #: 요청한 값이 거부돼 바꿔 보냈다면 그 사실(예: "medium 거부 → low").
+    reasoning_note: str | None = None
 
 
 # ── Agent 어휘 ───────────────────────────────────────────────────────────────
@@ -402,6 +411,8 @@ class CallRecord:
     #: 어느 라운드의 호출인지. 슬라이스 3 의 원장 조회가 라운드별 비용을
     #: 뽑으려면 필요합니다.
     round_no: int | None = None
+    #: 실제로 적용된 사고 수준. None 이면 보내지 않았습니다(모델 기본값).
+    reasoning_effort: str | None = None
 
 
 #: 채점 축.

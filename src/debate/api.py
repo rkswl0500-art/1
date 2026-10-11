@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from .agent import DEFAULT_PERSONA_FALLBACK, split_provider_model
 from .config import (
-    FAKE_PROVIDER, PricingTable, Settings, load_provider_slots,
+    FAKE_PROVIDER, REASONING_POLICIES, PricingTable, Settings, load_provider_slots,
     provider_registry,
 )
 from .config import _NAME_RE as _NAME_OK
@@ -143,6 +143,9 @@ class SlotIn(BaseModel):
     #: 비우면 **기존 키를 유지**합니다. 화면에는 마스킹만 내려가므로, 수정하지
     #: 않은 슬롯의 키를 브라우저가 되돌려 보낼 방법이 아예 없습니다.
     api_key: str = ""
+    #: auto/on/off. 비우면(None) **기존 값을 유지**합니다 — 키와 같은 규칙입니다.
+    #: 이게 없으면 화면에서 저장할 때마다 .env 에 손으로 적어둔 정책이 지워집니다.
+    reasoning: str | None = None
 
 
 class SaveSlots(BaseModel):
@@ -179,10 +182,12 @@ async def config_list(request: Request) -> dict:
              "key_masked": mask_key(
                  registry.get(name).api_key.get_secret_value()
                  if registry.get(name).api_key else None),
-             "has_key": registry.get(name).has_key}
+             "has_key": registry.get(name).has_key,
+             "reasoning": registry.get(name).reasoning}
             for name in registry.names()
         ],
         "presets": PROVIDER_PRESETS,
+        "reasoning_policies": list(REASONING_POLICIES),
     }
 
 
@@ -217,6 +222,11 @@ async def config_save(request: Request, body: SaveSlots) -> dict:
     _require_local(request)
     settings = Settings()
     stored = _stored_keys()
+    try:
+        stored_policy = {n: provider_registry().get(n).reasoning
+                         for n in provider_registry().names()}
+    except ConfigError:
+        stored_policy = {}
 
     seen: set[str] = set()
     slots: list[SlotInput] = []
@@ -232,8 +242,13 @@ async def config_save(request: Request, body: SaveSlots) -> dict:
         if not base_url.startswith(("http://", "https://")):
             raise HTTPException(400, f"{name}: BASE_URL 은 http(s):// 로 시작해야 합니다")
         seen.add(name)
+        policy = (entry.reasoning or stored_policy.get(name, "auto")).strip().lower()
+        if policy not in REASONING_POLICIES:
+            raise HTTPException(400, f"{name}: reasoning 은 "
+                                     f"{'/'.join(REASONING_POLICIES)} 중 하나입니다")
         # 빈 키 = 기존 유지. 이름이 바뀌었으면 기존 키가 없으므로 빈 값이 됩니다.
-        slots.append(SlotInput(name, base_url, entry.api_key or stored.get(name, "")))
+        slots.append(SlotInput(name, base_url, entry.api_key or stored.get(name, ""),
+                               reasoning=policy))
 
     save_slots(settings.env_path, slots)
     registry = provider_registry()      # 바로 다시 읽어 반영 확인

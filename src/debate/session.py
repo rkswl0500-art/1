@@ -22,7 +22,9 @@ from .config import PricingTable, Settings
 from .context import ContextBuilder
 from .cost import CostEstimate, CostMeter, Estimator
 from .engine import DebateEngine
-from .judge import Judge, Verdict, family_note, score_contradictions
+from .judge import (
+    Judge, Verdict, family_note, score_contradictions, truncation_advice,
+)
 from .models import (
     AgentDropped, AgentSpec, DebateCompleted, DebateConfig, DebateResult,
     DebateStarted, DebateState, Directive, IssuesExtracted, RoundCompleted,
@@ -281,6 +283,7 @@ class DebateSession:
         )
         judge = Judge(self.pool.get(self.judge_spec[0]), self.judge_spec[1],
                       max_tokens=self.settings.judge_max_tokens or None,
+                      reasoning_effort=self.settings.judge_reasoning_effort or None,
                       timeout_s=self.settings.request_timeout_s)
         # debate_completed 이후 판정까지 몇 분이 비면 화면이 멈춘 것과
         # 구분되지 않습니다. 시작을 알리고 UI 가 경과 시간을 돌립니다.
@@ -302,8 +305,7 @@ class DebateSession:
                 kind = self.verdict.failure_kind
                 await self._verdict_failed(
                     "심판 출력이 길이 제한에 걸려 중간에 잘렸습니다 "
-                    f"(finish_reason=length). DEBATE_JUDGE_MAX_TOKENS 를 올리거나 "
-                    "쟁점 수를 줄이십시오."
+                    f"(finish_reason=length). {truncation_advice(self.verdict)}"
                     if kind == "truncated" else
                     "심판이 올바른 JSON 을 반환하지 않았습니다 (형식 오류). "
                     "원문은 verdicts.raw 에 저장했습니다.",
@@ -354,6 +356,9 @@ class DebateSession:
             "repaired": v.repaired_from_truncation,
             "first_budget": v.first_budget,
             "first_output_tokens": v.first_output_tokens,
+            "reasoning_effort": v.reasoning_effort,
+            "repair_reasoning_effort": v.repair_reasoning_effort,
+            "reasoning_note": v.reasoning_note,
             # 산문의 점수가 표와 어긋나는 경우. 판정 자체는 유효하므로 실패로
             # 다루지 않고 표시만 합니다.
             "score_contradictions": list(score_contradictions(v)),

@@ -315,3 +315,69 @@ def test_debate_page_stays_open_to_the_tailnet(env):
     """설정만 막고 토론 화면은 열려야 합니다 — 안 그러면 다기기 자체가 무의미합니다."""
     with TestClient(api.app, client=("100.75.85.54", 0)) as c:
         assert c.get("/").status_code == 200
+
+
+# ── 슬롯의 사고 수준 전송 정책 ──────────────────────────────────────────────
+
+def test_reasoning_policy_survives_a_save_that_omits_it(client, env):
+    """화면은 키처럼 정책도 '비우면 유지' 입니다. 이게 없으면 .env 에 손으로
+    적어둔 정책이 화면에서 저장할 때마다 지워집니다."""
+    client.put("/config/providers", json={"slots": [
+        {"name": "groq", "base_url": "https://x.test/v1", "api_key": REAL_KEY,
+         "reasoning": "off"}]})
+    client.put("/config/providers", json={"slots": [          # reasoning 없이 저장
+        {"name": "groq", "base_url": "https://y.test/v1", "api_key": ""}]})
+
+    assert "DEBATE_PROVIDER_1_REASONING=off" in env.read_text(encoding="utf-8")
+    slots = client.get("/config/providers").json()["slots"]
+    assert slots[0]["reasoning"] == "off"
+
+
+def test_reasoning_policy_follows_the_slot_when_renumbered(client, env):
+    """저장할 때 슬롯 번호를 1 부터 다시 매깁니다. 정책이 번호에 묶여 있으면
+    순서를 바꾸는 순간 **다른 프로바이더**에 붙습니다."""
+    client.put("/config/providers", json={"slots": [
+        {"name": "gemini", "base_url": "https://g.test/v1", "api_key": REAL_KEY},
+        {"name": "groq", "base_url": "https://q.test/v1", "api_key": REAL_KEY,
+         "reasoning": "off"}]})
+    client.put("/config/providers", json={"slots": [          # gemini 를 삭제
+        {"name": "groq", "base_url": "https://q.test/v1", "api_key": ""}]})
+
+    by_name = {s["name"]: s["reasoning"] for s in
+               client.get("/config/providers").json()["slots"]}
+    assert by_name == {"groq": "off"}
+
+
+def test_default_policy_writes_no_line(client, env):
+    client.put("/config/providers", json={"slots": [
+        {"name": "gemini", "base_url": "https://g.test/v1", "api_key": REAL_KEY}]})
+    assert "REASONING" not in env.read_text(encoding="utf-8")
+
+
+def test_unknown_policy_is_refused(client, env):
+    r = client.put("/config/providers", json={"slots": [
+        {"name": "gemini", "base_url": "https://g.test/v1", "api_key": REAL_KEY,
+         "reasoning": "sometimes"}]})
+    assert r.status_code == 400
+
+
+def test_stray_reasoning_line_outside_the_block_is_removed():
+    """구역 밖에 `_1_REASONING` 이 남으면 번호를 다시 매긴 뒤 엉뚱한 슬롯에
+    붙습니다. NAME/KEY 와 똑같이 걷어냅니다."""
+    existing = "DEBATE_PROVIDER_1_REASONING=off\nOTHER=1\n"
+    out = merge(existing, [SlotInput("groq", "https://q.test/v1", "k")])
+    assert "DEBATE_PROVIDER_1_REASONING" not in out
+    assert "OTHER=1" in out
+
+
+def test_env_reasoning_is_validated(tmp_path):
+    from debate.config import load_provider_slots
+    from debate.models import ConfigError
+
+    env = {"DEBATE_PROVIDER_1_NAME": "groq", "DEBATE_PROVIDER_1_BASE_URL": "https://q.test/v1",
+           "DEBATE_PROVIDER_1_REASONING": "maybe"}
+    with pytest.raises(ConfigError, match="REASONING"):
+        load_provider_slots(env, env_file=None)
+
+    env["DEBATE_PROVIDER_1_REASONING"] = "ON"
+    assert load_provider_slots(env, env_file=None).get("groq").reasoning == "on"

@@ -24,7 +24,11 @@ from pathlib import Path
 BEGIN = "# >>> debate: providers (UI 가 관리합니다 — 직접 편집해도 되지만 저장 시 덮어씁니다)"
 END = "# <<< debate: providers"
 
-_SLOT_LINE = re.compile(r"^\s*DEBATE_PROVIDER_\d+_(NAME|BASE_URL|API_KEY)\s*=", re.I)
+#: 구역 밖에 흩어진 옛 슬롯 줄. REASONING 도 포함합니다 — 저장할 때 슬롯 번호를
+#: 1 부터 다시 매기므로, 구역 밖에 `_1_REASONING` 이 남으면 **다른 슬롯에**
+#: 붙어버립니다.
+_SLOT_LINE = re.compile(
+    r"^\s*DEBATE_PROVIDER_\d+_(NAME|BASE_URL|API_KEY|REASONING)\s*=", re.I)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +36,8 @@ class SlotInput:
     name: str
     base_url: str
     api_key: str = ""
+    #: reasoning_effort 전송 정책(auto/on/off). 기본값이면 줄을 쓰지 않습니다.
+    reasoning: str = "auto"
 
 
 def mask_key(key: str | None) -> str:
@@ -57,6 +63,8 @@ def render_slots(slots: list[SlotInput]) -> str:
         lines.append(f"DEBATE_PROVIDER_{i}_NAME={slot.name}")
         lines.append(f"DEBATE_PROVIDER_{i}_BASE_URL={slot.base_url}")
         lines.append(f"DEBATE_PROVIDER_{i}_API_KEY={slot.api_key}")
+        if slot.reasoning and slot.reasoning != "auto":
+            lines.append(f"DEBATE_PROVIDER_{i}_REASONING={slot.reasoning}")
     lines.append(END)
     return "\n".join(lines)
 

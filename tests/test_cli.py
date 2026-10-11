@@ -170,10 +170,13 @@ def _history(db_path):
                       (did, f"p{i}", "참가자 A", prov, "models/flash-lite"
                        if i == 0 else "flash-lite", "", "", 0))
 
-    def call(did, purpose, provider, model, out, finish="stop"):
-        c.execute("INSERT INTO llm_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    def call(did, purpose, provider, model, out, finish="stop", effort=None):
+        c.execute("INSERT INTO llm_calls (call_id, debate_id, purpose, agent_id,"
+                  " provider, model, round_no, in_tok, out_tok, cost_usd, priced,"
+                  " latency_ms, attempts, finish_reason, reasoning_effort)"
+                  " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (f"{did}{purpose}{model}{out}{finish}", did, purpose, "p0", provider,
-                   model, 1, 1000, out, "0", 1, 500, 1, finish))
+                   model, 1, 1000, out, "0", 1, 500, 1, finish, effort))
 
     def turn(did, agent, out, chars):
         c.execute("INSERT INTO utterances VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -314,4 +317,108 @@ def test_calibrate_reports_body_vs_budget_for_truncated_calls(tmp_path, monkeypa
     budget = required_output_tokens(3, 2)
     assert f"예산 {budget:,}tok" in out
     assert "본문 평균 409tok" in out                 # (408 + 410) / 2
+    assert "사고 예산·수준을 낮추는 쪽" in out
+
+
+def _user_history(db_path):
+    """사용자의 실제 calibrate 결과를 재현한 기록 + 새 low 실행.
+
+      gemini 기본값  1차 8건 중 4건 잘림(본문 ~271), 복구 4건 중 1건 또 잘림 → 실패 1
+      gpt-oss 기본값 1차 2건
+      fake 심판      판정 5건 (예전 집계가 이걸 섞어 15건으로 셌습니다)
+      gemini low     1차 3건, 잘림 0  ← 사용자가 다음에 돌릴 측정
+    """
+    import sqlite3
+
+    from debate.storage import SqliteStore
+
+    SqliteStore(db_path).close()
+    c = sqlite3.connect(db_path)
+    n = iter(range(10_000))
+
+    def debate(did):
+        c.execute("INSERT INTO debates (debate_id, topic, status, rounds, created_at)"
+                  " VALUES (?,?,?,?,?)", (did, "T", "completed", 2, "2026-10-01"))
+        for i in range(4):
+            c.execute("INSERT INTO issues VALUES (?,?,?)", (did, f"i{i}", "쟁점"))
+        for i in range(2):
+            c.execute("INSERT INTO participants VALUES (?,?,?,?,?,?,?,?)",
+                      (did, f"p{i}", "참가자", "gemini", "flash-lite", "", "", 0))
+
+    def call(did, provider, model, out, finish="stop", effort=None):
+        c.execute("INSERT INTO llm_calls (call_id, debate_id, purpose, agent_id,"
+                  " provider, model, round_no, in_tok, out_tok, cost_usd, priced,"
+                  " latency_ms, attempts, finish_reason, reasoning_effort)"
+                  " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (f"c{next(n)}", did, "judge", None, provider, model, None, 2000, out,
+                   "0", 1, 500, 1, finish, effort))
+
+    def verdict(did, status="ok", finish="stop", attempts=1):
+        c.execute("INSERT INTO verdicts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (did, "m", status, "참가자 A", "narrow", "", "", "{}", "[]", "{}",
+                   2000, finish, attempts, "", ""))
+
+    gem = "models/gemini-3-flash-preview"
+    for i in range(4):                                   # 정상
+        debate(f"g_ok{i}"); call(f"g_ok{i}", "gemini", gem, 1100); verdict(f"g_ok{i}")
+    for i in range(3):                                   # 잘림 → 복구 성공
+        d = f"g_rep{i}"; debate(d)
+        call(d, "gemini", gem, 271, "length"); call(d, "gemini", gem, 600)
+        verdict(d, attempts=2)
+    debate("g_fail")                                     # 잘림 → 복구도 잘림
+    call("g_fail", "gemini", gem, 271, "length"); call("g_fail", "gemini", gem, 300, "length")
+    verdict("g_fail", status="unparsed", finish="length", attempts=2)
+
+    for i in range(2):
+        debate(f"q{i}"); call(f"q{i}", "groq", "openai/gpt-oss-120b", 1688); verdict(f"q{i}")
+    for i in range(5):
+        debate(f"f{i}"); call(f"f{i}", "fake", gem, 150); verdict(f"f{i}")
+    for i in range(3):                                   # 새 측정: low
+        debate(f"low{i}"); call(f"low{i}", "gemini", gem, 1500, effort="low")
+        verdict(f"low{i}")
+    c.commit()
+    c.close()
+
+
+def _calibrate_user(tmp_path, monkeypatch, capsys) -> str:
+    db = tmp_path / "user.db"
+    _user_history(db)
+    monkeypatch.setenv("DEBATE_DB_PATH", str(db))
+    assert cli.main(["calibrate"]) == 0
+    return capsys.readouterr().out
+
+
+def test_verdict_tally_excludes_fake_and_splits_by_model(tmp_path, monkeypatch, capsys):
+    """예전 집계는 verdicts 를 통째로 세서 fake 판정 5건이 '정상' 에 섞였습니다
+    (판정 15건 vs 실제 심판 1차 호출 10건)."""
+    out = _calibrate_user(tmp_path, monkeypatch, capsys)
+    section = out[out.index("사용자가 실제로 본 판정"):]
+
+    assert "사용자가 실제로 본 판정 13건 (fake 제외)" in section     # 8 + 2 + 3
+    assert "fake 심판 5건" in section
+    row = next(ln for ln in section.splitlines()
+               if "gemini-3-flash-preview [기본값]" in ln)
+    # 사용자가 추론한 그대로: 1차 8건 = 정상 4 + 복구 3 + 실패 1
+    assert row.split()[2:5] == ["4", "3", "1"]
+    assert "unparsed/length" in row
+
+
+def test_low_runs_are_not_mixed_with_default_effort_runs(tmp_path, monkeypatch, capsys):
+    """사용자의 다음 측정(low 3회)이 옛 기본값(high) 기록과 한 평균에 섞이면
+    'low 로 잘림이 사라졌는가' 를 알 수 없습니다."""
+    out = _calibrate_user(tmp_path, monkeypatch, capsys)
+    table = out[out.index("판정 출력"):out.index("사용자가 실제로 본 판정")]
+
+    low = next(l for l in table.splitlines() if "[low]" in l)
+    default = next(l for l in table.splitlines()
+                   if "gemini-3-flash-preview [기본값]" in l)
+    assert "1,500" in low and "  0" in low                # low: 잘림 0, 자기 평균
+    assert "1,500" not in default                          # 기본값 행에 안 섞임
+    assert "[minimal]" not in table                        # 복구가 유령 행을 안 만듦
+
+
+def test_body_vs_budget_reproduces_the_users_96_percent(tmp_path, monkeypatch, capsys):
+    """사용자 실측: 잘린 1차 본문 271 / 예산 7,710 — 사고가 96% 를 먹음."""
+    out = _calibrate_user(tmp_path, monkeypatch, capsys)
+    assert "본문 평균 271tok" in out
     assert "사고 예산·수준을 낮추는 쪽" in out

@@ -67,6 +67,43 @@ def looks_non_chat(model_id: str) -> str | None:
     return None
 
 
+#: `reasoning_effort` 를 받는다고 문서로 확인한 모델 계열.
+#:
+#:   gemini-2.5 / gemini-3  OpenAI 호환 엔드포인트가 thinking_budget/level 로 매핑
+#:   gpt-oss                Groq: low/medium/high, 범위 밖이면 400
+#:
+#: 슬롯 정책이 auto 일 때만 이 표를 봅니다. 표에 없는 모델은 **보내지 않습니다**
+#: — Groq 는 미지원 값에 400 을 내므로, 모르는 모델에 보내면 판정 단계에서
+#: 토론 전체를 날릴 수 있습니다. 새 모델은 슬롯을 on 으로 두면 됩니다.
+#: (Qwen 은 none/default 라는 다른 값 체계를 써서 일부러 넣지 않았습니다.)
+REASONING_EFFORT_PATTERNS: tuple[str, ...] = ("gemini-2.5", "gemini-3", "gpt-oss")
+
+#: 보낼 수 있는 값. 'none' 은 뺐습니다 — Gemini 3 는 사고를 끌 수 없고
+#: gpt-oss 는 그 값을 받지 않습니다.
+REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+#: 서버가 거부했을 때 물러설 값. Gemini(2.5/3)와 gpt-oss 가 공통으로 받습니다.
+_SAFE_EFFORT = "low"
+
+
+def supports_reasoning_effort(model_id: str) -> bool:
+    name = model_id.lower()
+    return any(p in name for p in REASONING_EFFORT_PATTERNS)
+
+
+def _rejects_reasoning(resp: httpx.Response) -> bool:
+    """400 이 사고 수준 때문인지.
+
+    Gemini: "Thinking level MEDIUM is not supported", Groq: reasoning_effort 범위
+    오류. 문구가 바뀔 수 있어 단어로만 봅니다 — 놓치면 원래대로 FatalError 가
+    나므로, 오탐보다 미탐이 안전한 쪽입니다.
+    """
+    if resp.status_code != 400:
+        return False
+    text = resp.text.lower()
+    return any(w in text for w in ("reasoning", "thinking", "effort"))
+
+
 # ── 에러 ─────────────────────────────────────────────────────────────────────
 
 
@@ -120,6 +157,7 @@ class OpenAICompatProvider:
                  transport: httpx.AsyncBaseTransport | None = None,
                  dump: Callable[[ChatRequest, dict], None] | None = None) -> None:
         self.name = slot.name
+        self._reasoning_policy = slot.reasoning
         #: 원본 응답을 그대로 넘겨받는 훅. 잘림 원인 규명용(--dump-raw).
         self._dump = dump
         self._base_url = slot.base_url
@@ -135,6 +173,25 @@ class OpenAICompatProvider:
             transport=transport,  # 테스트에서 MockTransport 주입용
         )
 
+    def effort_for(self, req: ChatRequest) -> str | None:
+        """이 요청에 실제로 실어 보낼 사고 수준."""
+        effort = req.reasoning_effort
+        if not effort or self._reasoning_policy == "off":
+            return None
+        if self._reasoning_policy == "auto" and not supports_reasoning_effort(req.model):
+            return None
+        return effort
+
+    async def _post(self, payload: dict, timeout_s: float) -> httpx.Response:
+        try:
+            return await self._client.post(
+                "/chat/completions", json=payload, timeout=timeout_s
+            )
+        except httpx.TimeoutException as e:
+            raise RetryableError(f"{self.name}: timeout ({e})") from e
+        except httpx.TransportError as e:
+            raise RetryableError(f"{self.name}: transport error ({e})") from e
+
     async def chat(self, req: ChatRequest) -> ChatResponse:
         payload: dict = {
             "model": req.model,
@@ -143,16 +200,28 @@ class OpenAICompatProvider:
         }
         if req.max_tokens is not None:
             payload["max_tokens"] = req.max_tokens
+        effort = self.effort_for(req)
+        if effort:
+            payload["reasoning_effort"] = effort
 
         started = time.perf_counter()
-        try:
-            resp = await self._client.post(
-                "/chat/completions", json=payload, timeout=req.timeout_s
-            )
-        except httpx.TimeoutException as e:
-            raise RetryableError(f"{self.name}: timeout ({e})") from e
-        except httpx.TransportError as e:
-            raise RetryableError(f"{self.name}: transport error ({e})") from e
+        resp = await self._post(payload, req.timeout_s)
+
+        # 서버가 그 사고 수준을 거부하면 한 번 물러섭니다: 요청값 → low → (안 보냄).
+        # 문서상 Gemini 3 일부 버전이 minimal/medium 을, gpt-oss 가 범위 밖 값을
+        # 400 으로 거부합니다. 판정 단계에서 400 으로 죽으면 토론 전체가 날아가므로
+        # 여기서 흡수하고, 무엇을 바꿨는지는 응답에 남깁니다.
+        note = None
+        while effort and _rejects_reasoning(resp):
+            fallback = _SAFE_EFFORT if effort != _SAFE_EFFORT else None
+            note = (f"{effort} 거부 → {fallback}" if fallback
+                    else f"{effort} 거부 → 보내지 않음(모델 기본값)")
+            effort = fallback
+            if effort:
+                payload["reasoning_effort"] = effort
+            else:
+                payload.pop("reasoning_effort", None)
+            resp = await self._post(payload, req.timeout_s)
         latency_ms = int((time.perf_counter() - started) * 1000)
 
         self._raise_for_status(resp)
@@ -192,6 +261,8 @@ class OpenAICompatProvider:
             ),
             latency_ms=latency_ms,
             finish_reason=finish_reason,
+            reasoning_effort=effort,
+            reasoning_note=note,
         )
 
     def _raise_for_status(self, resp: httpx.Response) -> None:
@@ -507,6 +578,7 @@ class MeteredProvider:
             attempts=resp.attempts,
             finish_reason=resp.finish_reason,
             round_no=req.round_no,
+            reasoning_effort=resp.reasoning_effort,
         )
         return resp
 

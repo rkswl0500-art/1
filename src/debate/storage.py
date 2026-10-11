@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     call_id TEXT PRIMARY KEY, debate_id TEXT NOT NULL, purpose TEXT NOT NULL,
     agent_id TEXT, provider TEXT, model TEXT, round_no INTEGER,
     in_tok INTEGER, out_tok INTEGER, cost_usd TEXT, priced INTEGER,
-    latency_ms INTEGER, attempts INTEGER, finish_reason TEXT
+    latency_ms INTEGER, attempts INTEGER, finish_reason TEXT,
+    reasoning_effort TEXT
 );
 CREATE TABLE IF NOT EXISTS verdicts (
     debate_id TEXT PRIMARY KEY, judge_model TEXT, status TEXT,
@@ -80,7 +81,20 @@ class SqliteStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path)
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    #: (테이블, 컬럼, 타입). `CREATE TABLE IF NOT EXISTS` 는 이미 있는 테이블에
+    #: 컬럼을 더하지 않으므로, 기존 DB 에는 여기서 붙입니다. 옛 행은 NULL 로
+    #: 남습니다 — reasoning_effort 가 NULL 이면 "보내지 않았음(모델 기본값)" 과
+    #: 같은 뜻이라 그대로 맞습니다.
+    _ADDED_COLUMNS = (("llm_calls", "reasoning_effort", "TEXT"),)
+
+    def _migrate(self) -> None:
+        for table, column, kind in self._ADDED_COLUMNS:
+            have = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     def save(self, result: DebateResult, meter: CostMeter,
              verdict: Verdict | None = None, family: FamilyNote | None = None) -> None:
@@ -118,12 +132,17 @@ class SqliteStore:
                   str(u.cost_usd), u.finish_reason)
                  for r in result.rounds for u in r.utterances],
             )
+            # 컬럼을 이름으로 적습니다. 마이그레이션으로 붙은 컬럼은 맨 뒤에 오므로
+            # 위치로 쓰면 스키마 순서가 바뀌는 날 조용히 엉뚱한 칸에 들어갑니다.
             self._conn.executemany(
-                "INSERT OR REPLACE INTO llm_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO llm_calls (call_id, debate_id, purpose, agent_id,"
+                " provider, model, round_no, in_tok, out_tok, cost_usd, priced,"
+                " latency_ms, attempts, finish_reason, reasoning_effort)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(c.call_id, c.debate_id, c.purpose, c.agent_id, c.provider, c.model,
                   c.round_no, c.usage.prompt_tokens, c.usage.completion_tokens,
                   str(c.cost_usd), int(c.priced), c.latency_ms, c.attempts,
-                  c.finish_reason) for c in meter.records],
+                  c.finish_reason, c.reasoning_effort) for c in meter.records],
             )
             if verdict is not None:
                 self._conn.execute(

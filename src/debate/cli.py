@@ -28,7 +28,7 @@ from .config import (
 from .cost import CostMeter, Estimator
 from .context import ContextBuilder
 from .engine import DebateEngine
-from .judge import Judge, family_note, score_contradictions
+from .judge import Judge, family_note, score_contradictions, truncation_advice
 from .session import new_debate_id
 from .storage import SqliteStore
 from .models import (
@@ -303,8 +303,7 @@ def _print_verdict(verdict) -> None:
         if verdict.failure_kind == "truncated":
             print("  ⚠ 판정이 길이 제한에 걸려 중간에 잘렸습니다 "
                   "(finish_reason=length). 형식 문제가 아닙니다.")
-            print(f"     DEBATE_JUDGE_MAX_TOKENS 를 올리거나(현재 자동 계산) "
-                  f"쟁점 수를 줄이십시오. 시도 {verdict.parse_attempts}회.")
+            print(f"     {truncation_advice(verdict)} 시도 {verdict.parse_attempts}회.")
         else:
             print("  ⚠ 판정이 올바른 JSON 이 아니었습니다 (형식 오류). "
                   f"시도 {verdict.parse_attempts}회.")
@@ -342,6 +341,13 @@ def _print_verdict(verdict) -> None:
             print(f"     1차: 본문 {verdict.first_output_tokens:,}tok / 예산 "
                   f"{verdict.first_budget:,}tok — 차액 {gap:,}tok 은 응답에 "
                   "안 보이는 사고 토큰으로 보입니다.")
+        if (verdict.repair_reasoning_effort
+                and verdict.repair_reasoning_effort != verdict.reasoning_effort):
+            print(f"     복구 호출은 사고 수준을 {verdict.reasoning_effort} → "
+                  f"{verdict.repair_reasoning_effort} 로 낮췄습니다.")
+    print(f"  사고 수준: {verdict.reasoning_effort or '모델 기본값(보내지 않음)'}")
+    if verdict.reasoning_note:
+        print(f"  ⚠ 사고 수준을 바꿔 보냈습니다: {verdict.reasoning_note}")
     for note in score_contradictions(verdict):
         # 점수 필드는 정확합니다. 산문만 틀렸으므로 표를 믿으라고 알려줍니다.
         print(f"  ⚠ {note}\n     위 표의 점수가 정확합니다.")
@@ -477,6 +483,20 @@ def _model_key(model: str) -> str:
     return model.rsplit("/", 1)[-1]
 
 
+def _judge_key(model: str, first_effort: str | None) -> str:
+    """판정 집계 키: 모델 + **그 토론 1차 호출의** 사고 수준.
+
+    사고 수준이 다르면 같은 모델이라도 다른 측정입니다 — low 로 돈 판정과
+    모델 기본값(gemini-3-flash-preview 는 high)으로 돈 판정을 한 평균에 섞으면
+    둘 다 의미를 잃습니다. NULL 은 '보내지 않음' 이고, 이 컬럼이 생기기 전의
+    기록도 전부 여기에 들어갑니다(그때는 보낸 적이 없으므로 맞습니다).
+
+    복구 호출은 사고 수준을 한 단계 낮춰 보내므로 **자기 값**으로 묶으면 1차가
+    0건인 유령 행이 생깁니다. 그래서 1차의 값을 씁니다.
+    """
+    return f"{_model_key(model)} [{first_effort or '기본값'}]"
+
+
 #: 잘리지 않고 정상 종료한 것으로 보는 값. 그 외에는 전부 세어서 보여줍니다 —
 #: 프로바이더마다 문자열이 달라서(`length`, `MAX_TOKENS`, …) 목록을 미리
 #: 고정하면 모르는 값이 조용히 '정상' 으로 들어갑니다.
@@ -498,13 +518,18 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     """
     import sqlite3
 
-    from .judge import required_output_tokens, verdict_content_tokens
+    from .judge import (
+        required_output_tokens, thinking_reserve_for, verdict_content_tokens,
+    )
 
     settings = Settings()
     if not settings.db_path.is_file():
         print(f"기록이 없습니다: {settings.db_path}", file=sys.stderr)
         return 2
 
+    # 스키마를 먼저 맞춥니다. pull 직후 토론을 한 번도 안 돌리고 calibrate 부터
+    # 돌리면 옛 DB 에는 reasoning_effort 컬럼이 없어 쿼리가 죽습니다.
+    SqliteStore(settings.db_path).close()
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
 
@@ -523,6 +548,8 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     rows = list(conn.execute("""
         SELECT l.model, l.out_tok, l.finish_reason, d.debate_id,
                ROW_NUMBER() OVER (PARTITION BY l.debate_id ORDER BY l.rowid) AS seq,
+               FIRST_VALUE(l.reasoning_effort) OVER (
+                   PARTITION BY l.debate_id ORDER BY l.rowid) AS first_effort,
                (SELECT COUNT(*) FROM issues i WHERE i.debate_id = d.debate_id) AS issues,
                (SELECT COUNT(*) FROM participants p WHERE p.debate_id = d.debate_id) AS parts
         FROM llm_calls l JOIN debates d USING (debate_id)
@@ -534,9 +561,9 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         return 0
 
     print("판정 출력: 실측 대 모델 (verdict_content_tokens)\n")
-    print(f"  {'모델':24} {'1차':>4} {'잘림':>4} {'복구':>4} {'실측 평균':>9} "
+    print(f"  {'심판 [사고 수준]':36} {'1차':>4} {'잘림':>4} {'복구':>4} {'실측 평균':>9} "
           f"{'모델 평균':>9} {'비율':>6}")
-    print("  " + "─" * 70)
+    print("  " + "─" * 82)
 
     by_model: dict[str, list[tuple[int, int, bool, bool]]] = {}
     spellings: dict[str, set[str]] = {}
@@ -545,15 +572,16 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     #: 계산이었다면 쟁점·참가자 수로 다시 구할 수 있습니다.
     cut_vs_budget: dict[str, list[tuple[int, int]]] = {}
     for r in rows:
-        key = _model_key(r["model"])
-        spellings.setdefault(key, set()).add(r["model"])
+        key = _judge_key(r["model"], r["first_effort"])
+        spellings.setdefault(_model_key(r["model"]), set()).add(r["model"])
         cut = r["finish_reason"] not in _CLEAN_FINISH
         repair = r["seq"] > 1
         if cut:
             finishes[r["finish_reason"]] = finishes.get(r["finish_reason"], 0) + 1
             if not repair:
                 budget = settings.judge_max_tokens or required_output_tokens(
-                    max(1, r["issues"]), max(1, r["parts"]))
+                    max(1, r["issues"]), max(1, r["parts"]),
+                    thinking_reserve=thinking_reserve_for(r["first_effort"]))
                 cut_vs_budget.setdefault(key, []).append((r["out_tok"], budget))
         modelled = verdict_content_tokens(max(1, r["issues"]), max(1, r["parts"]))
         by_model.setdefault(key, []).append((r["out_tok"], modelled, cut, repair))
@@ -569,13 +597,13 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         repairs = sum(1 for *_, rep in quads if rep)
         cut_rate[model] = cuts / len(first) if first else 0.0
         if not clean:
-            print(f"  {model:24} {len(first):>4} {cuts:>4} {repairs:>4} "
+            print(f"  {model:36} {len(first):>4} {cuts:>4} {repairs:>4} "
                   f"{'—':>9} {'—':>9} {'전부 잘림':>6}")
             continue
         actual = sum(a for a, _ in clean) / len(clean)
         modelled = sum(m for _, m in clean) / len(clean)
         ratio = actual / modelled if modelled else 0
-        print(f"  {model:24} {len(first):>4} {cuts:>4} {repairs:>4} "
+        print(f"  {model:36} {len(first):>4} {cuts:>4} {repairs:>4} "
               f"{actual:>9,.0f} {modelled:>9,.0f} {ratio:>5.2f}x")
 
     merged = {k: v for k, v in spellings.items() if len(v) > 1}
@@ -625,27 +653,51 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     # 여기까지는 **호출** 기준입니다. 사용자가 실제로 본 건 verdicts 입니다 —
     # 잘려도 복구에 성공하면 status='ok' 로 완결된 판정을 봅니다. 둘을 구분하지
     # 않으면 "판정 42% 가 잘려 보였다" 같은 틀린 결론이 나옵니다.
+    # verdicts 에는 provider 가 없습니다. 그 토론의 **첫 판정 호출**에서 provider·
+    # 모델·사고 수준을 가져옵니다. 예전 집계는 이 연결 없이 verdicts 를 통째로
+    # 세서 fake 판정이 섞였습니다 — 실측: 판정 15건인데 실제 심판 1차 호출은 10건.
     seen = list(conn.execute("""
-        SELECT judge_model, status, finish_reason, parse_attempts, COUNT(*) AS n
-        FROM verdicts GROUP BY judge_model, status, finish_reason, parse_attempts
+        WITH first_judge AS (
+            SELECT debate_id, provider, model, reasoning_effort,
+                   ROW_NUMBER() OVER (PARTITION BY debate_id ORDER BY rowid) AS seq
+            FROM llm_calls WHERE purpose = 'judge'
+        )
+        SELECT v.status, v.finish_reason, v.parse_attempts,
+               f.provider, f.model, f.reasoning_effort
+        FROM verdicts v
+        LEFT JOIN first_judge f ON f.debate_id = v.debate_id AND f.seq = 1
     """))
     if seen:
-        total = sum(r["n"] for r in seen)
-        broken = [r for r in seen if r["status"] != "ok"]
-        repaired = sum(r["n"] for r in seen
-                       if r["status"] == "ok" and (r["parse_attempts"] or 1) > 1)
-        print(f"\n사용자가 실제로 본 판정 {total}건:")
-        print(f"  정상        {total - sum(r['n'] for r in broken) - repaired:>4}건")
-        print(f"  복구 후 정상 {repaired:>4}건   (점수는 유효, 길이는 줄여 받음)")
-        print(f"  실패        {sum(r['n'] for r in broken):>4}건", end="")
-        if broken:
-            kinds = ", ".join(f"{r['status']}/{r['finish_reason']}" for r in broken)
-            print(f"   ({kinds})")
-        else:
-            print("")
-        if repaired and not broken:
-            print("\n  잘린 호출이 있어도 **완결된 판정을 봤습니다** — 복구가 받아냈습니다.")
-            print("  비용은 판정 1건당 호출 2회로 늘고, 그 판정은 줄여 받은 것입니다.")
+        fake_v = sum(1 for r in seen if r["provider"] == FAKE_PROVIDER)
+        orphan = sum(1 for r in seen if r["provider"] is None)
+        real = [r for r in seen if r["provider"] not in (None, FAKE_PROVIDER)]
+        tally: dict[str, list[int]] = {}           # 키 → [정상, 복구, 실패]
+        fails: dict[str, list[str]] = {}
+        for r in real:
+            key = _judge_key(r["model"], r["reasoning_effort"])
+            row = tally.setdefault(key, [0, 0, 0])
+            if r["status"] != "ok":
+                row[2] += 1
+                fails.setdefault(key, []).append(f"{r['status']}/{r['finish_reason']}")
+            elif (r["parse_attempts"] or 1) > 1:
+                row[1] += 1
+            else:
+                row[0] += 1
+
+        print(f"\n사용자가 실제로 본 판정 {len(real)}건 (fake 제외)\n")
+        print(f"  {'심판':40} {'정상':>4} {'복구':>4} {'실패':>4}")
+        print("  " + "─" * 58)
+        for key, (ok, rep, bad) in sorted(tally.items()):
+            print(f"  {key:40} {ok:>4} {rep:>4} {bad:>4}"
+                  + (f"   ({', '.join(fails[key])})" if bad else ""))
+        print("\n  복구 = 1차가 잘려 '짧게' 다시 받은 판정. 점수는 유효하지만 길이는 줄여 받음.")
+        if fake_v or orphan:
+            parts = []
+            if fake_v:
+                parts.append(f"fake 심판 {fake_v}건")
+            if orphan:
+                parts.append(f"원장과 연결되지 않은 판정 {orphan}건(초기 debate_id 버그 시기)")
+            print(f"  뺀 것: {', '.join(parts)}.")
     if len(by_model) > 1:
         print("\n  모델(벤더)마다 비율이 뚜렷이 다르면 프로바이더별 계수를 둘 근거가"
               " 됩니다.")
@@ -827,6 +879,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         if judge_spec and anon_transcript:
             judge = Judge(pool.get(judge_spec[0]), judge_spec[1],
                           max_tokens=settings.judge_max_tokens or None,
+                          reasoning_effort=settings.judge_reasoning_effort or None,
                           timeout_s=settings.request_timeout_s)
             print(f"\n판정 중 — {judge_spec[1]} (쟁점 {len(result.issues)}개)", flush=True)
             started = time.perf_counter()

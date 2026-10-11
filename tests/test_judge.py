@@ -416,3 +416,111 @@ def test_prompt_forbids_computing_totals_in_prose():
     rendered = _PROMPT.format(topic="t", issues="i", reasoning_chars=REASONING_CHARS,
                               rubric_example=", ".join(f'"{k}": 7' for k in RUBRIC_KEYS))
     assert "합계 점수를 쓰지 마십시오" in rendered
+
+
+# ── 사고 수준(reasoning_effort) ─────────────────────────────────────────────
+
+class EffortEcho(ScriptedProvider):
+    """프로바이더처럼 '요청한 사고 수준을 그대로 적용했다' 고 돌려줍니다.
+
+    `out` 은 1차 호출의 본문 토큰 — 이걸로 '사고가 예산을 먹었다' 와 '진짜로
+    길이가 모자랐다' 를 만들어냅니다.
+    """
+
+    def __init__(self, *replies: str, out: int, truncate_first: bool = True) -> None:
+        super().__init__(*replies)
+        self._out = out
+        self._truncate = truncate_first
+
+    async def chat(self, req):
+        from dataclasses import replace
+        resp = await super().chat(req)
+        first = len(self.requests) == 1
+        return replace(resp, reasoning_effort=req.reasoning_effort,
+                       usage=Usage(100, self._out if first else 500),
+                       finish_reason="length" if (first and self._truncate) else "stop")
+
+
+async def test_judge_asks_for_the_configured_effort():
+    p = EffortEcho(GOOD, out=900, truncate_first=False)
+    v = await Judge(p, "models/gemini-3-flash-preview",
+                    reasoning_effort="low").evaluate("주제", ISSUES, TRANSCRIPT, LABELS)
+
+    assert p.requests[0].reasoning_effort == "low"
+    assert v.reasoning_effort == "low"            # 실제 적용값이 판정에 남습니다
+
+
+async def test_thinking_truncation_steps_effort_down_on_repair():
+    """실측: 본문 271 / 예산 7,710 으로 잘렸고, 예산 2배 + '짧게' 지시로도 복구가
+    또 잘려 판정이 실패했습니다. 사고가 예산을 먹었으면 예산이 아니라 사고 수준을
+    낮춰야 합니다."""
+    p = EffortEcho('{"per_issue": [', GOOD, out=271)
+    v = await Judge(p, "models/gemini-3-flash-preview",
+                    reasoning_effort="low").evaluate("주제", ISSUES, TRANSCRIPT, LABELS)
+
+    assert v.status == "ok"
+    assert [r.reasoning_effort for r in p.requests] == ["low", "minimal"]
+    assert (v.reasoning_effort, v.repair_reasoning_effort) == ("low", "minimal")
+
+
+async def test_gpt_oss_floor_is_low():
+    """gpt-oss 는 low/medium/high 만 받습니다 — minimal 로 내려가면 400 입니다."""
+    p = EffortEcho('{"per_issue": [', GOOD, out=200)
+    await Judge(p, "openai/gpt-oss-120b",
+                reasoning_effort="low").evaluate("주제", ISSUES, TRANSCRIPT, LABELS)
+
+    assert [r.reasoning_effort for r in p.requests] == ["low", "low"]
+
+
+async def test_genuine_length_truncation_keeps_the_effort():
+    """본문이 예산 대부분을 썼다면 사고 탓이 아닙니다 — 사고 수준을 건드릴
+    이유가 없고, 예산 2배와 '짧게' 지시가 맞는 대처입니다."""
+    from debate.judge import required_output_tokens, thinking_reserve_for
+
+    budget = required_output_tokens(len(ISSUES), len(LABELS),
+                                    thinking_reserve=thinking_reserve_for("low"))
+    p = EffortEcho('{"per_issue": [', GOOD, out=int(budget * 0.9))
+    await Judge(p, "models/gemini-3-flash-preview",
+                reasoning_effort="low").evaluate("주제", ISSUES, TRANSCRIPT, LABELS)
+
+    assert [r.reasoning_effort for r in p.requests] == ["low", "low"]
+
+
+@pytest.mark.parametrize("effort,model,expected", [
+    ("high", "gemini-3", "medium"),
+    ("medium", "gemini-3", "low"),
+    ("low", "gemini-3", "minimal"),
+    ("minimal", "gemini-3", "minimal"),           # 더 내려갈 곳이 없음
+    ("low", "openai/gpt-oss-120b", "low"),        # gpt-oss 바닥
+    ("high", "openai/gpt-oss-120b", "medium"),
+    (None, "gemini-3", None),                     # 보내지 않았으면 그대로
+])
+def test_step_down_ladder(effort, model, expected):
+    from debate.judge import step_down_effort
+    assert step_down_effort(effort, model) == expected
+
+
+def test_thinking_reserve_is_raised_only_for_high():
+    """예산은 상한이지 비용이 아닙니다 — 낮춰도 아끼는 토큰은 0 이고 잘릴
+    위험만 늘어납니다. high 는 실측 하한(7,439)을 넘어야 해서 올립니다."""
+    from debate.judge import thinking_reserve_for
+
+    assert thinking_reserve_for("low") == thinking_reserve_for(None) == 6000
+    assert thinking_reserve_for("high") > 7439
+
+
+def test_truncation_advice_depends_on_the_cause():
+    """원인에 따라 대처가 **반대**입니다. 사고 탓인데 예산을 올리라고 하면
+    사고가 그만큼 더 먹습니다."""
+    from debate.judge import truncation_advice
+
+    thinking = Verdict(per_issue=(), rubric={}, winner=None, margin="tie",
+                       conclusion="", dissent="", first_budget=7710,
+                       first_output_tokens=271, reasoning_effort="low")
+    genuine = Verdict(per_issue=(), rubric={}, winner=None, margin="tie",
+                      conclusion="", dissent="", first_budget=7710,
+                      first_output_tokens=7600)
+
+    assert "REASONING_EFFORT" in truncation_advice(thinking)
+    assert "예산을 올리지 말고" in truncation_advice(thinking)
+    assert "MAX_TOKENS 를 올리거나" in truncation_advice(genuine)

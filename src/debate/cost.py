@@ -78,6 +78,7 @@ class CostMeter:
         attempts: int = 1,
         finish_reason: str | None = None,
         round_no: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> CallRecord:
         cost, priced = self._pricing.cost_for(model, usage)
         rec = CallRecord(
@@ -94,6 +95,7 @@ class CostMeter:
             attempts=attempts,
             finish_reason=finish_reason,
             round_no=round_no,
+            reasoning_effort=reasoning_effort,
         )
         self._records.append(rec)
         return rec

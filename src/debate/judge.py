@@ -40,9 +40,69 @@ def verdict_content_tokens(issue_count: int, participant_count: int) -> int:
     )
 
 
+#: 사고 수준별 사고 몫(출력 예산 중 사고 토큰에 남겨둘 양).
+#:
+#: **낮추지 않는 이유**: 예산은 상한이지 비용이 아닙니다 — 과금은 실제로 쓴
+#: 토큰으로 됩니다. low 에서 사고 몫을 줄여도 아끼는 토큰은 0 이고 잘릴 위험만
+#: 늘어납니다. low 가 실제로 얼마나 사고하는지는 아직 재지 않았으니, 잰 뒤에
+#: 줄일지 정합니다.
+#:
+#: **high 만 올리는 이유** — 실측: 기본 사고 수준(문서상 high)의 gemini-3-flash-
+#: preview 심판이 예산 7,710 에서 본문 271 만 내고 잘렸습니다. 사고가 **최소**
+#: 7,439 를 썼고, 잘렸으니 더 쓰려 했습니다. 16,000 은 그 하한의 약 2배라는
+#: 추정이지 측정이 아닙니다.
+_THINKING_RESERVE = {"high": 16000}
+_DEFAULT_THINKING_RESERVE = 6000
+
+
+def thinking_reserve_for(effort: str | None) -> int:
+    return _THINKING_RESERVE.get(effort or "", _DEFAULT_THINKING_RESERVE)
+
+
+#: 복구 때 사고 수준을 한 단계씩 낮추는 순서.
+_EFFORT_LADDER = ("high", "medium", "low", "minimal")
+
+
+def step_down_effort(effort: str | None, model: str) -> str | None:
+    """사고가 예산을 먹어 잘렸을 때 복구 호출에 쓸 한 단계 낮은 사고 수준.
+
+    바닥은 모델마다 다릅니다. gpt-oss 는 low/medium/high 만 받으므로 low 가
+    바닥이고, Gemini 는 minimal 까지 문서에 있습니다. (일부 Gemini 3 버전은
+    minimal 을 거부한다는 보고가 있지만, 거부되면 프로바이더가 low 로 물러서므로
+    시도해도 토론이 죽지는 않습니다.)
+    """
+    if effort not in _EFFORT_LADDER:
+        return effort
+    floor = "low" if "gpt-oss" in model.lower() else "minimal"
+    i = _EFFORT_LADDER.index(effort)
+    if _EFFORT_LADDER[i] == floor or i == len(_EFFORT_LADDER) - 1:
+        return effort
+    return _EFFORT_LADDER[i + 1]
+
+
+def truncation_advice(verdict: "Verdict") -> str:
+    """잘린 판정에 대한 대처. **원인에 따라 반대입니다.**
+
+    본문이 예산의 절반도 안 되면 예산을 먹은 건 사고 토큰이라, 예산을 올리면
+    사고가 그만큼 더 먹습니다(실측: 예산 2배 복구 호출도 같은 이유로 잘림).
+    본문이 예산 대부분을 썼다면 그때는 진짜로 길이가 모자란 것입니다.
+    """
+    body, budget = verdict.first_output_tokens, verdict.first_budget
+    if budget and body / budget < 0.5:
+        effort = verdict.repair_reasoning_effort or verdict.reasoning_effort
+        where = (f"사고 수준 {effort} 로도 모자랐습니다 — " if effort
+                 else "사고 수준을 보내지 않았습니다(모델 기본값) — ")
+        return (f"본문 {body:,}tok / 예산 {budget:,}tok: 예산 대부분을 응답에 안 보이는 "
+                f"사고 토큰이 썼습니다. {where}예산을 올리지 말고 "
+                "DEBATE_JUDGE_REASONING_EFFORT 를 낮추거나, 슬롯의 사고 수준 전송을 "
+                "'항상(on)' 으로 두십시오.")
+    return ("본문이 예산 대부분을 썼습니다. DEBATE_JUDGE_MAX_TOKENS 를 올리거나 "
+            "쟁점 수를 줄이십시오.")
+
+
 def required_output_tokens(
     issue_count: int, participant_count: int, *,
-    thinking_reserve: int = 6000, cap: int = 32768,
+    thinking_reserve: int = _DEFAULT_THINKING_RESERVE, cap: int = 32768,
 ) -> int:
     """판정 JSON 을 다 쓰고도 남을 출력 예산.
 
@@ -112,6 +172,11 @@ class Verdict:
     #: "사고가 예산을 먹었다" 를 구분할 수 있습니다.
     first_budget: int = 0
     first_output_tokens: int = 0
+    #: 1차 / 복구 호출에 **실제로 적용된** 사고 수준(None 이면 보내지 않음).
+    reasoning_effort: str | None = None
+    repair_reasoning_effort: str | None = None
+    #: 서버가 요청한 사고 수준을 거부해 바꿔 보냈다면 그 사실.
+    reasoning_note: str | None = None
     #: Judge 에게 실제로 보낸 프롬프트 전문.
     #:
     #: 저장해 두는 이유는 익명화를 **증명**하기 위해서입니다. 모델명이 안 샌다는
@@ -173,11 +238,14 @@ _PROMPT = """당신은 토론 심판입니다. 참가자가 아니며, 어느 �
 
 class Judge:
     def __init__(self, provider, model: str, *, max_tokens: int | None = None,
-                 timeout_s: float = 180.0, seed: int = 0) -> None:
+                 timeout_s: float = 180.0, seed: int = 0,
+                 reasoning_effort: str | None = None) -> None:
         self._provider = provider
         self._model = model
         #: None 이면 쟁점·참가자 수에 맞춰 evaluate() 에서 계산합니다.
         self._max_tokens = max_tokens
+        #: 요청할 사고 수준. 실제로 실릴지는 슬롯 정책과 모델이 정합니다.
+        self._effort = reasoning_effort or None
         self._timeout_s = timeout_s
         self._rng = random.Random(seed)
 
@@ -203,18 +271,26 @@ class Judge:
         messages = [Message("system", system), Message("user", body)]
         sent = f"{system}\n\n{body}"
 
-        budget = self._max_tokens or required_output_tokens(len(issues), len(labels))
+        budget = self._max_tokens or required_output_tokens(
+            len(issues), len(labels), thinking_reserve=thinking_reserve_for(self._effort))
         raw, resp, truncated = "", None, False
         first_budget, first_out, repaired = budget, 0, False
+        effort = self._effort
+        applied: list[str | None] = []
+        notes: list[str] = []
 
         for attempt in (1, 2):
             resp = await self._provider.chat(ChatRequest(
                 model=self._model, messages=tuple(messages),
                 temperature=0.1, max_tokens=budget,
                 timeout_s=self._timeout_s, purpose="judge",
+                reasoning_effort=effort,
             ))
             raw = resp.text
             truncated = resp.finish_reason == "length"
+            applied.append(resp.reasoning_effort)
+            if resp.reasoning_note:
+                notes.append(resp.reasoning_note)
             if attempt == 1:
                 first_out = resp.usage.completion_tokens
             try:
@@ -225,6 +301,9 @@ class Judge:
                     finish_reason=resp.finish_reason, parse_attempts=attempt,
                     repaired_from_truncation=repaired,
                     first_budget=first_budget, first_output_tokens=first_out,
+                    reasoning_effort=applied[0],
+                    repair_reasoning_effort=applied[1] if len(applied) > 1 else None,
+                    reasoning_note="; ".join(notes) or None,
                     prompt_text=sent,
                 )
             except ValueError as e:
@@ -232,6 +311,14 @@ class Judge:
                     break
                 if truncated:
                     repaired = True
+                    # 본문이 예산의 절반도 안 되는데 잘렸다면 예산을 먹은 건 응답에
+                    # 안 보이는 사고 토큰입니다. 이때 예산만 늘리면 사고가 그만큼 더
+                    # 먹습니다 — 실측: 예산 2배 + "짧게" 지시로도 복구 호출이 또
+                    # 잘려 판정이 실패했습니다. 사고 수준을 한 단계 낮춥니다.
+                    # (시작점은 1차에 **실제로 적용된** 값입니다 — 서버가 거부해
+                    #  물러선 값일 수 있습니다.)
+                    if budget and first_out / budget < 0.5:
+                        effort = step_down_effort(applied[0] or effort, self._model)
                     # 같은 예산으로 다시 부르면 같은 자리에서 또 잘립니다.
                     # 예산을 늘리면서 동시에 더 짧게 쓰라고 지시합니다 —
                     # 예산만 올리면 장황한 모델은 늘어난 만큼 더 씁니다.
@@ -259,6 +346,9 @@ class Judge:
             finish_reason=resp.finish_reason if resp else None,
             parse_attempts=2, repaired_from_truncation=repaired,
             first_budget=first_budget, first_output_tokens=first_out,
+            reasoning_effort=applied[0] if applied else None,
+            repair_reasoning_effort=applied[1] if len(applied) > 1 else None,
+            reasoning_note="; ".join(notes) or None,
             prompt_text=sent,
         )
 
