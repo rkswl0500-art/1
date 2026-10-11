@@ -265,14 +265,15 @@ def test_loopback_classification(host, loopback):
     assert api.Settings(host=host).host_is_loopback is loopback
 
 
-def test_gate_is_on_by_default():
-    """게이트 기본값. 0 이면 라운드 사이에 사람이 끼어들 틈이 아예 없습니다.
+def test_api_gate_default_does_not_stall_non_interactive_callers():
+    """API 기본값은 0 — 대기 없음입니다(무한 대기가 아닙니다).
 
-    다기기의 주 용도가 '폰에서 라운드 사이에 지시를 넣는 것'이라 기본으로
-    켭니다. 0 은 무한 대기가 아니라 '대기 없음'입니다(HttpGate.collect).
+    한 번 300 으로 올렸다가 되돌렸습니다. 웹 UI 는 `gatesec` 를 항상 실어 보내서
+    이 기본값이 폰 사용자에게 닿지 않고, 지시를 넣지 않는 스크립트만 라운드
+    경계마다 기다리게 됩니다. 사람이 끼어들 시간은 UI 기본값에서 조정합니다.
     """
     body = api.CreateDebate(topic="t", participants=[
         api.Participant(provider="fake", model="fake-a"),
         api.Participant(provider="fake", model="fake-b"),
     ])
-    assert body.gate_timeout_s == 300.0
+    assert body.gate_timeout_s == 0.0

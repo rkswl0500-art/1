@@ -54,6 +54,25 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .metric.primary .v{color:var(--accent)}
 .est{margin-left:auto;font-size:12px;color:var(--muted);text-align:right}
 
+/* 폰: sticky 비용 바가 화면을 먹지 않게.
+   견적은 '시작 전'에 보는 숫자고, 토론이 시작되면 바로 옆에 실제 수치가 있어
+   의미가 없어집니다. 390px 에서는 이 줄이 지표들과 같은 줄에 못 들어가
+   아래로 내려가면서 바를 150px 로 만듭니다(≥768px 에서는 80px).
+   그래서 sticky 를 푸는 대신(요구사항: 비용·토큰·요청 수는 항상 보여야 함)
+   **진행 중에만** 견적 줄을 접습니다. 시작 전에는 그대로 보입니다. */
+@media (max-width:767px){
+  .costbar.running .est{display:none}
+  .costbar{gap:14px}
+}
+
+/* 터치 타겟. 토론 중 실제로 누르는 것만 44px 로 올립니다 — 설정 요소까지
+   키우면 폰에서 설정 패널이 한 화면을 넘어갑니다. */
+@media (max-width:767px),(pointer:coarse){
+  button.chip{min-height:44px;padding:3px 12px}
+  #btn-send,#btn-skip{min-height:44px;padding:10px 16px}
+  #gate-text{min-height:88px}
+}
+
 /* 참가자 카드 */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
 .card{border:1px solid var(--line);border-radius:9px;padding:10px 12px;background:var(--bg)}
@@ -148,7 +167,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
         <label>라운드</label><input id="rounds" type="number" value="3" min="1" max="10">
       </div>
       <div style="width:150px">
-        <label>개입 대기(초)</label><input id="gatesec" type="number" value="120" min="0" max="1800">
+        <label>개입 대기(초)</label><input id="gatesec" type="number" value="300" min="0" max="1800">
       </div>
     </div>
     <label>참가자 <span class="note" style="margin:0">— 프로바이더를 고르면 모델
@@ -795,6 +814,7 @@ $('btn-create').onclick = async () => {
       · $${(+e.low_usd).toFixed(4)}~${(+e.high_usd).toFixed(4)}
       ${e.judge_repair_tokens?`<br>판정 복구 시 +${n(e.judge_repair_tokens)} tok`:''}
       ${e.unpriced.length?'<br>가격 미상: '+e.unpriced.join(', '):''}`;
+    document.querySelector('.costbar').classList.remove('running');
     $('setup-msg').textContent = `${debateId} 생성됨 · LLM 호출 ${j.llm_calls_made}회`;
     if(j.judge) $('setup-msg').textContent += ` · ${j.judge.note}`;
     $('btn-start').disabled = false;
@@ -805,6 +825,8 @@ $('btn-create').onclick = async () => {
 
 $('btn-start').onclick = async () => {
   $('btn-start').disabled = true; $('btn-create').disabled = true;
+  // 폰에서 sticky 바가 화면의 18% 를 먹지 않게, 진행 중에는 견적 줄을 접습니다.
+  document.querySelector('.costbar').classList.add('running');
   es = new EventSource(`/debates/${debateId}/stream`);
   es.onopen = () => $('conn').textContent = '연결됨 (SSE)';
   es.onerror = () => { if(es) $('conn').textContent = '재연결 중…'; };
