@@ -56,6 +56,69 @@ python -m debate.cli calibrate
 벤더 때문인지 모델·주제·프롬프트 때문인지 가를 수 없습니다. `calibrate` 로
 숫자가 쌓이면 그때 판단할 문제입니다.
 
+##### calibrate 가 거르는 것 — 그리고 왜 한때 안 걸렀는지
+
+`calibrate` 는 **fake 실행을 뺍니다**(`provider='fake'`). 뺀 건수는 항상 찍습니다.
+
+fake 모드로 돌려도 **모델명은 사용자가 고른 실제 이름이 그대로 남습니다.** 이건
+버그가 아니라 의도입니다 — "이 설정을 리허설했다"는 기록이 남는 편이 낫고,
+`provider` 가 `fake` 라 구분은 명확합니다. 버그는 집계 쪽에 있었습니다: 예전
+쿼리가 모델명으로만 묶고 `provider` 를 한 번도 보지 않아서, fake 출력(130토큰
+/161자)이 `openai/gpt-oss-120b` 와 `models/gemini-3.8-live` 의 **실측치로
+보고됐습니다.** 실제 모델이 fake 와 토큰·글자 수까지 일치할 확률이 사실상 0인데,
+표만 보면 그게 실측으로 보입니다.
+
+```
+fake 실행 2건을 뺐습니다 (provider='fake').
+```
+
+**잘린 판정은 평균에서 뺍니다.** `finish_reason` 이 `stop` 계열이 아닌 건을 따로
+세어 `잘림` 열에 보여주고, 평균은 정상 종료한 건으로만 냅니다. 잘린 판정의 길이는
+그 모델이 그만큼 쓴다는 뜻이 아니라 **예산이 거기서 끝났다**는 뜻이라, 섞으면
+간결한 모델로 오독됩니다. 1,150·1,190·408(length) 세 건을 섞으면 916 — 실제보다
+22% 낮고, 그 숫자로 "이 벤더는 간결하다"고 결론 내면 버그를 성향으로 착각합니다.
+
+**접두사만 다른 표기를 합칩니다.** `models/gemini-3.5-flash-lite` 와
+`gemini-3.5-flash-lite` 는 같은 모델인데 요청/응답에서 다르게 옵니다. 따로 묶이면
+건수가 반으로 보이고 평균도 갈립니다. 합친 사실은 출력에 명시합니다.
+
+##### 벤더 차이만 보고 싶다면 — 통제 실험
+
+위 표에서 모델 간 비율 차이가 보여도, 주제가 다르면 길이도 다릅니다. 벤더 효과만
+분리하려면 **토론자를 fake 로 고정하고 심판만 바꿉니다.**
+
+```bash
+# 같은 주제로 심판만 바꿔 3~5회씩. fake 발언은 매번 같으므로
+# 판정 길이 차이는 순수하게 심판 벤더 차이입니다.
+for i in 1 2 3; do
+  python -m debate.cli run --provider-override fake \
+    --topic "원격근무는 팀 생산성을 높이는가" \
+    --agent "fake-a|찬성" --agent "fake-b|반대" --rounds 2 \
+    --judge gemini/<모델>
+done
+# 심판만 groq/<모델> 로 바꿔 같은 횟수 반복
+python -m debate.cli calibrate
+```
+
+`--provider-override fake` 는 **참가자만** fake 로 돌립니다. `--judge` 에 프로바이더를
+명시하면 그 슬롯은 실제 키로 붙습니다(`.env` 에 있어야 합니다). 프로바이더를 생략하면
+심판도 fake 가 됩니다.
+
+- 비용은 **판정 호출만** 듭니다 (토론 발언은 fake 라 0).
+- fake 발언이 결정론적이라 입력 프롬프트가 매번 동일합니다 — 길이 차이에 주제·
+  발언 변동이 섞이지 않습니다.
+- 심판 행은 `provider` 가 실제 벤더로 남으므로 위 fake 필터에 걸리지 않습니다.
+  참가자 행만 빠집니다. 스텁 심판으로 실측한 한 실행에서 `llm_calls` 6행 중
+  5행(fake 발언·쟁점)이 빠지고 심판 1행만 집계에 들어갔습니다.
+- 3~5회를 권하는 이유는 같은 프롬프트에도 출력 길이가 흔들리기 때문입니다. 한
+  번씩 재고 배수를 정하면 그건 보정이 아니라 과적합입니다.
+
+> 이 절차는 **원래 동작하지 않았습니다.** `--provider-override fake` 가 풀을 fake
+> 하나로만 만들어서, 참가자와 다른 벤더의 심판을 붙이면 라운드를 **다 돌린 뒤**
+> `ConfigError` 로 죽었습니다. 같은 이유로 fake 가 아닌 실행에서도 참가자와 다른
+> 벤더를 심판으로 쓰면 CLI 가 죽었습니다(API 경로는 처음부터 심판을 풀에 넣고
+> 있어서 이 버그가 없었습니다). 절차를 문서에 적기 전에 돌려봐서 찾았습니다.
+
 #### 견적이 실제로 맞는지 — 측정 4건
 
 | 실행 | 견적 | 실제 | 판정 |
@@ -789,6 +852,21 @@ tailscale serve --bg 8000           # tailnet:443 → 127.0.0.1:8000 (한 번만
 .\scripts\start-remote.ps1 -Port 8001   # 포트를 옮길 때 (serve 도 같이 옮기십시오)
 ```
 
+`.ps1` 이 실행 정책에 막히면(`이 시스템에서 스크립트를 실행할 수 없으므로`):
+
+```powershell
+# 이 창에서만 허용 — 시스템 설정을 바꾸지 않습니다
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\scripts\start-remote.ps1
+
+# 또는 한 번만 우회
+powershell -ExecutionPolicy Bypass -File .\scripts\start-remote.ps1
+```
+
+`-Scope Process` 는 그 창이 닫히면 사라집니다. 영구로 바꾸는
+`Set-ExecutionPolicy RemoteSigned`(CurrentUser) 도 되지만, 이 스크립트 하나
+때문에 시스템 기본값을 바꿀 이유는 없습니다.
+
 > 이 스크립트는 **실행 검증을 하지 못했습니다** — 개발 환경에 PowerShell 이 없습니다.
 > 로직은 단순하지만 Windows 에서 처음 돌릴 때는 출력을 확인해 주십시오. 파일은
 > UTF-8 **BOM 포함**으로 저장돼 있습니다. Windows PowerShell 5.1 은 BOM 이 없으면
@@ -891,6 +969,13 @@ python -m debate.cli serve       # bind 127.0.0.1:8000 | workers=1 | config_ui=o
 | `/config/providers` | **404** (`설정 UI 가 꺼져 있습니다`) |
 | HTTPS | `tailscale serve` 가 붙여줌 |
 | 실기기 (LTE, 와이파이 아님) | 토론 실행 · `지시 없이 바로 진행` 모두 동작 |
+
+**`tailscale serve` 를 거치면 클라이언트 주소는 폰의 tailnet IP 입니다** — 실측
+`100.75.85.54:0` (포트 0). 루프백으로 둔갑하지 않습니다. 그래서 서버가
+`127.0.0.1` 에 바인드돼 있어도 `_require_local` 은 이 요청을 **외부 출처로 보고
+403** 합니다. 바인드 주소로 판정했다면 통과시켰을 요청입니다 — 요청 출처로
+판정하기로 한 결정이 여기서 값을 합니다. 이 주소를 그대로 쓴 테스트가 있습니다
+(`test_tailnet_client_is_refused_even_though_the_bind_is_loopback`).
 
 이걸로 1단계는 끝입니다. 애플리케이션에 인증 코드를 넣지 않았고, 바인드 주소도
 기본값 그대로입니다.

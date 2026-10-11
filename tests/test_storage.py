@@ -413,7 +413,9 @@ def test_calibrate_compares_actuals_to_the_model(tmp_path, monkeypatch, capsys):
     assert _cmd_calibrate(object()) == 0
     out = capsys.readouterr().out
 
-    assert "openai/gpt-oss-120b" in out
+    # 벤더 접두사는 떼고 묶습니다 — `openai/gpt-oss-120b` 와 `gpt-oss-120b` 가
+    # 따로 집계되면 건수가 반으로 보이고 평균도 갈립니다 (cli._model_key).
+    assert "gpt-oss-120b" in out
     modelled = verdict_content_tokens(3, 2)
     assert f"{modelled:,}" in out            # 모델값이 보여야 비교가 됩니다
     assert "1,504" in out                    # 실측값도

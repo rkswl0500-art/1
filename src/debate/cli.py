@@ -457,12 +457,34 @@ async def _cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _model_key(model: str) -> str:
+    """`models/gemini-3.5-flash-lite` 와 `gemini-3.5-flash-lite` 를 한 행으로.
+
+    같은 모델이 요청과 응답에서 접두사가 다르게 옵니다. 그대로 묶으면 통계가
+    둘로 갈려서 건수가 적어 보이고 평균도 따로 놉니다. `PricingTable._lookup`
+    과 같은 규칙(마지막 구간)입니다.
+    """
+    return model.rsplit("/", 1)[-1]
+
+
+#: 잘리지 않고 정상 종료한 것으로 보는 값. 그 외에는 전부 세어서 보여줍니다 —
+#: 프로바이더마다 문자열이 달라서(`length`, `MAX_TOKENS`, …) 목록을 미리
+#: 고정하면 모르는 값이 조용히 '정상' 으로 들어갑니다.
+_CLEAN_FINISH = {"stop", "end_turn", "eos", None, ""}
+
+
 def _cmd_calibrate(args: argparse.Namespace) -> int:
     """기록된 실사용량을 견적 모델과 비교합니다.
 
     "Groq 심판이 Gemini 보다 길게 쓰는가" 같은 질문을 **추측이 아니라 데이터로**
     답하려고 있습니다. 벤더별 상수를 넣을지 말지는 여기 숫자가 쌓인 뒤에
     결정할 문제입니다 — 한 건으로 배수를 확정하면 보정이 아니라 과적합입니다.
+
+    **fake 실행은 뺍니다.** fake 모드로 돌려도 모델명은 사용자가 고른 실제
+    이름이 그대로 남습니다(그 설정을 리허설했다는 기록이라 지우지 않습니다).
+    `provider` 가 `fake` 라 구분은 명확한데, 예전 쿼리가 모델명으로만 묶고
+    provider 를 안 봐서 fake 출력이 실제 모델의 실측치로 보고됐습니다.
+    뺀 건수는 **반드시 찍습니다** — 조용히 거르면 집계가 왜 비었는지 모릅니다.
     """
     import sqlite3
 
@@ -475,55 +497,114 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
 
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
+
+    excluded = conn.execute(
+        "SELECT COUNT(*) FROM llm_calls WHERE provider = ?", (FAKE_PROVIDER,)
+    ).fetchone()[0]
+    if excluded:
+        print(f"fake 실행 {excluded}건을 뺐습니다 (provider='{FAKE_PROVIDER}').")
+        print("  fake 는 모델명이 고른 그대로 남으므로, 모델명으로만 묶으면 "
+              "실제 모델의 실측치로 보입니다.\n")
+
     rows = list(conn.execute("""
-        SELECT l.model, l.out_tok, l.in_tok, d.debate_id,
+        SELECT l.model, l.out_tok, l.in_tok, l.finish_reason, d.debate_id,
                (SELECT COUNT(*) FROM issues i WHERE i.debate_id = d.debate_id) AS issues,
                (SELECT COUNT(*) FROM participants p WHERE p.debate_id = d.debate_id) AS parts
         FROM llm_calls l JOIN debates d USING (debate_id)
-        WHERE l.purpose = 'judge' AND l.out_tok > 0
+        WHERE l.purpose = 'judge' AND l.out_tok > 0 AND l.provider IS NOT ?
         ORDER BY l.model
-    """))
+    """, (FAKE_PROVIDER,)))
     if not rows:
-        print("판정 호출 기록이 없습니다.")
+        print("판정 호출 기록이 없습니다 (fake 제외).")
         return 0
 
     print("판정 출력: 실측 대 모델 (verdict_content_tokens)\n")
-    print(f"  {'모델':30} {'건수':>4} {'실측 평균':>9} {'모델 평균':>9} {'비율':>6}")
-    print("  " + "─" * 62)
-    by_model: dict[str, list[tuple[int, int]]] = {}
-    for r in rows:
-        modelled = verdict_content_tokens(max(1, r["issues"]), max(1, r["parts"]))
-        by_model.setdefault(r["model"], []).append((r["out_tok"], modelled))
+    print(f"  {'모델':28} {'건수':>4} {'잘림':>4} {'실측 평균':>9} {'모델 평균':>9} {'비율':>6}")
+    print("  " + "─" * 66)
 
-    for model, pairs in sorted(by_model.items()):
-        actual = sum(a for a, _ in pairs) / len(pairs)
-        modelled = sum(m for _, m in pairs) / len(pairs)
+    by_model: dict[str, list[tuple[int, int, bool]]] = {}
+    spellings: dict[str, set[str]] = {}
+    finishes: dict[str, int] = {}
+    for r in rows:
+        key = _model_key(r["model"])
+        spellings.setdefault(key, set()).add(r["model"])
+        cut = r["finish_reason"] not in _CLEAN_FINISH
+        if cut:
+            finishes[r["finish_reason"]] = finishes.get(r["finish_reason"], 0) + 1
+        modelled = verdict_content_tokens(max(1, r["issues"]), max(1, r["parts"]))
+        by_model.setdefault(key, []).append((r["out_tok"], modelled, cut))
+
+    for model, trips in sorted(by_model.items()):
+        # 잘린 판정의 길이는 '그 모델이 그만큼 쓴다' 는 뜻이 아니라 '예산이
+        # 거기서 끝났다' 는 뜻입니다. 평균에 섞으면 간결한 모델로 오독됩니다.
+        clean = [(a, m) for a, m, cut in trips if not cut]
+        cuts = sum(1 for *_, cut in trips if cut)
+        if not clean:
+            print(f"  {model:28} {len(trips):>4} {cuts:>4} {'—':>9} {'—':>9} "
+                  f"{'전부 잘림':>6}")
+            continue
+        actual = sum(a for a, _ in clean) / len(clean)
+        modelled = sum(m for _, m in clean) / len(clean)
         ratio = actual / modelled if modelled else 0
-        print(f"  {model:30} {len(pairs):>4} {actual:>9,.0f} {modelled:>9,.0f} {ratio:>5.2f}x")
+        print(f"  {model:28} {len(trips):>4} {cuts:>4} {actual:>9,.0f} "
+              f"{modelled:>9,.0f} {ratio:>5.2f}x")
+
+    merged = {k: v for k, v in spellings.items() if len(v) > 1}
+    if merged:
+        print("\n  접두사만 다른 표기를 합쳤습니다:")
+        for key, raws in sorted(merged.items()):
+            print(f"    {key} ← {', '.join(sorted(raws))}")
 
     print("\n  비율 1.00 이면 모델이 정확합니다. 1 보다 크면 모델이 낮게 잡는 것입니다.")
+    print("  평균은 **잘리지 않은 건만** 씁니다 — 잘린 판정의 길이는 모델의 성향이")
+    print("  아니라 예산이 끝난 지점입니다.")
+    if finishes:
+        detail = ", ".join(f"{k!r}×{v}" for k, v in sorted(finishes.items()))
+        print(f"\n  ⚠ 잘린 판정이 있습니다: {detail}")
+        print("  이건 벤더 성향이 아니라 출력 예산 문제입니다. thinking 계열은 사고")
+        print("  토큰이 같은 예산을 먹습니다 — DEBATE_JUDGE_MAX_TOKENS 를 올리거나,")
+        print("  0(자동) 으로 두고 judge.required_output_tokens 를 보십시오.")
     if len(by_model) > 1:
-        print("  모델(벤더)마다 비율이 뚜렷이 다르면 프로바이더별 계수를 둘 근거가 됩니다.")
+        print("\n  모델(벤더)마다 비율이 뚜렷이 다르면 프로바이더별 계수를 둘 근거가"
+              " 됩니다.")
+        print("  단, 주제가 다르면 길이도 달라집니다. 벤더 차이만 보려면 토론자를")
+        print("  fake 로 고정하고 심판만 바꿔서 같은 주제로 여러 번 돌리십시오"
+              " (README).")
     else:
-        print(f"  비교하려면 다른 심판 모델로도 돌려야 합니다 (지금 {len(by_model)}종).")
+        print(f"\n  비교하려면 다른 심판 모델로도 돌려야 합니다 (지금 {len(by_model)}종).")
 
     turns = list(conn.execute("""
-        SELECT p.model, COUNT(*) n, AVG(u.out_tok) avg_out, AVG(LENGTH(u.content)) avg_chars
+        SELECT p.model, u.out_tok, LENGTH(u.content) AS chars
         FROM utterances u JOIN participants p
           ON p.debate_id = u.debate_id AND p.agent_id = u.agent_id
-        WHERE u.status = 'ok' AND u.out_tok > 0
-        GROUP BY p.model
-    """))
+        WHERE u.status = 'ok' AND u.out_tok > 0 AND p.provider IS NOT ?
+    """, (FAKE_PROVIDER,)))
     if turns:
-        print("\n발언 1건: 실측 (견적 가정 R1 250~450자 / R2+ 350~600자)\n")
-        print(f"  {'모델':30} {'건수':>4} {'출력토큰':>8} {'글자':>7} {'토큰/자':>7}")
-        print("  " + "─" * 62)
+        agg: dict[str, list[tuple[int, int]]] = {}
         for r in turns:
-            per = r["avg_out"] / r["avg_chars"] if r["avg_chars"] else 0
-            print(f"  {r['model']:30} {r['n']:>4} {r['avg_out']:>8,.0f} "
-                  f"{r['avg_chars']:>7,.0f} {per:>7.2f}")
-        print(f"\n  토큰/자 가 설정값({settings.ko_tokens_per_char})과 크게 다르면 "
-              "DEBATE_KO_TOKENS_PER_CHAR 를 조정하십시오.")
+            agg.setdefault(_model_key(r["model"]), []).append((r["out_tok"], r["chars"]))
+
+        print("\n발언 1건: 실측 (견적 가정 R1 250~450자 / R2+ 350~600자)\n")
+        print(f"  {'모델':28} {'건수':>4} {'출력토큰':>8} {'글자':>7} {'토큰/자':>7}")
+        print("  " + "─" * 66)
+        tot_tok = tot_chars = 0
+        for model, pairs in sorted(agg.items()):
+            avg_out = sum(t for t, _ in pairs) / len(pairs)
+            avg_chars = sum(c for _, c in pairs) / len(pairs)
+            tot_tok += sum(t for t, _ in pairs)
+            tot_chars += sum(c for _, c in pairs)
+            per = avg_out / avg_chars if avg_chars else 0
+            print(f"  {model:28} {len(pairs):>4} {avg_out:>8,.0f} "
+                  f"{avg_chars:>7,.0f} {per:>7.2f}")
+        if tot_chars:
+            weighted = tot_tok / tot_chars
+            print(f"\n  가중 평균 {weighted:.2f} 토큰/자 · 설정값 "
+                  f"{settings.ko_tokens_per_char} (DEBATE_KO_TOKENS_PER_CHAR)")
+            if weighted and abs(weighted - settings.ko_tokens_per_char) / weighted > 0.1:
+                direction = "높게" if settings.ko_tokens_per_char > weighted else "낮게"
+                print(f"  설정값이 {direction} 잡고 있습니다. 다만 **벤더가 한쪽으로"
+                      " 쏠려 있으면** 그 벤더에")
+                print("  맞추는 것일 뿐입니다 — 토크나이저가 다르면 값도 다릅니다.")
     conn.close()
     return 0
 
@@ -579,14 +660,31 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     meter = CostMeter(pricing, debate_id)
     global _current_budget
     _current_budget = settings.max_output_tokens
+    # 심판도 풀에 들어가야 합니다. 예전에는 참가자 프로바이더만 조립해서,
+    # 참가자와 다른 벤더를 심판으로 쓰면 **라운드를 다 돌린 뒤** 심판 단계에서
+    # ConfigError 로 죽었습니다 (API 경로는 처음부터 넣고 있었습니다).
+    real_for: set[str] = set()
+    if judge_spec and judge_spec[0] != FAKE_PROVIDER:
+        real_for.add(judge_spec[0])
+
+    # fake 모드에서 심판만 진짜면 레지스트리가 필요합니다 — 통제 실험
+    # (토론자 fake + 심판만 실제) 의 전제입니다.
+    registry = provider_registry(settings) if (not fake or real_for) else None
+
+    pool_specs = list(specs)
+    if judge_spec and not fake:
+        pool_specs.append(
+            AgentSpec("__judge__", "__judge__", judge_spec[0], judge_spec[1], ""))
+
     pool = build_pool(
-        specs,
-        None if fake else provider_registry(settings),
+        pool_specs,
+        registry,
         meter,
         settings,
         fake=_build_fake(specs, args.fake_latency, args.fail_agent,
                          args.fail_mode) if fake else None,
         dump=_make_dump(args.dump_raw),
+        real_for=real_for,
     )
 
     concurrency = args.max_concurrency or settings.max_concurrency
@@ -716,8 +814,8 @@ def _cmd_serve(args) -> int:
         # **올바른** 구성입니다. 예전 메시지는 이 경우에도 "다른 기기에서는 붙지
         # 않는다"고 단정해서, 제대로 맞춰 놓은 사람에게 틀렸다고 말했습니다.
         print("  루프백 바인드 — 이 주소로 직접 붙을 수 있는 건 이 컴퓨터뿐입니다.")
-        print("  · `tailscale serve --bg {}` 로 프록시 중이라면 이게 맞는 구성입니다 "
-              "(프록시가 127.0.0.1 로 붙습니다).".format(port))
+        print(f"  · `tailscale serve --bg {port}` 로 프록시 중이라면 이게 맞는 "
+              "구성입니다 (프록시가 127.0.0.1 로 붙습니다).")
         print("  · 프록시 없이 폰에서 직접 붙으려면 DEBATE_HOST 를 tailscale IP 로 "
               "바꾸십시오.")
     else:
@@ -726,10 +824,18 @@ def _cmd_serve(args) -> int:
         # 말할 수 있는 지점이므로 말합니다.
         print(f"  루프백이 아닌 주소에 바인드합니다. {host} 에 닿을 수 있는 "
               "모든 기기가 토론을 시작할 수 있습니다 — 당신의 쿼터로.")
-        if settings.config_ui.lower() == "local":
-            print("  경고: DEBATE_CONFIG_UI 가 아직 'local' 입니다. 설정 화면은 "
-                  "루프백 클라이언트만 받으므로 키가 새지는 않지만, 다기기 "
-                  "구성에서는 'off' 로 두십시오.", file=sys.stderr)
+
+    # 설정 UI 경고는 **바인드와 무관하게** 띄웁니다.
+    #
+    # 예전에는 루프백이 아닐 때만 띄웠는데, `tailscale serve` 를 쓰면 바인드는
+    # 루프백인 채로 폰에서 닿습니다 — 경고가 가장 필요한 구성에서 침묵했습니다.
+    # 바인드 주소만으로는 "밖에서 닿는가"를 알 수 없다는 게 이 프로젝트에서
+    # 이미 확인된 사실이고(api._require_local), 그건 여기서도 똑같습니다.
+    if settings.config_ui.lower() == "local":
+        print("  경고: DEBATE_CONFIG_UI 가 'local' 입니다. 프록시나 터널을 앞에 "
+              "두는 구성이라면 'off' 로 두십시오.", file=sys.stderr)
+        print("        (루프백이 아닌 클라이언트는 _require_local 이 403 으로 "
+              "막지만, 그건 두 번째 방어선입니다.)", file=sys.stderr)
 
     uvicorn.run("debate.api:app", host=host, port=port, workers=1)
     return 0

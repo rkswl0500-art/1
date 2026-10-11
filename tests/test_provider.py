@@ -10,9 +10,12 @@ import pytest
 
 from debate.config import PricingTable, ProviderSlot, load_provider_slots
 from debate.cost import CostMeter
-from debate.models import ChatRequest, ChatResponse, ConfigError, Message, Usage
+from debate.models import (
+    AgentSpec, ChatRequest, ChatResponse, ConfigError, Message, Usage,
+)
 from debate.provider import (
     FakeBehavior,
+    build_pool,
     FakeProvider,
     FatalError,
     MeteredProvider,
@@ -415,3 +418,48 @@ def test_gpt_oss_120b_and_safeguard_are_distinguished():
 
     assert looks_non_chat("openai/gpt-oss-120b") is None
     assert looks_non_chat("openai/gpt-oss-safeguard-20b") is not None
+
+
+# ── 통제 실험: 토론자 fake + 심판만 실제 ────────────────────────────────────
+
+def _meter_and_settings():
+    from debate.config import Settings
+
+    return CostMeter(PricingTable({}), "d_test"), Settings()
+
+
+def test_fake_mode_can_keep_one_provider_real():
+    """벤더별 판정 길이를 재려면 발언이 매번 같아야 합니다.
+
+    fake 는 결정론적이라 그 조건을 만족하는데, 예전에는 fake 모드가 심판까지
+    fake 로 끌고 가서 이 측정 자체가 불가능했습니다. `--provider-override fake`
+    에 실제 심판을 붙이면 라운드를 다 돌린 **뒤** ConfigError 로 죽었습니다.
+    """
+    from debate.config import ProviderRegistry
+
+    meter, settings = _meter_and_settings()
+    registry = ProviderRegistry(
+        slots={"groq": ProviderSlot(name="groq", base_url="http://127.0.0.1:1/v1",
+                                    api_key=SecretStr("k"))},
+        env_file=None, env_file_found=False)
+    specs = [AgentSpec("p1", "참가자 A", "fake", "fake-a", ""),
+             AgentSpec("p2", "참가자 B", "fake", "fake-b", "")]
+
+    pool = build_pool(specs, registry, meter, settings,
+                      fake=FakeProvider(), real_for={"groq"})
+
+    assert pool.get("fake") is not None            # 토론자는 fake
+    assert pool.get("groq") is not None            # 심판만 실제 슬롯
+    assert pool.get("groq") is not pool.get("fake")
+
+
+def test_real_for_without_registry_fails_before_any_call():
+    """심판 슬롯이 없는 걸 라운드를 다 돌린 뒤에 알면 그 비용이 버려집니다."""
+    meter, settings = _meter_and_settings()
+    specs = [AgentSpec("p1", "참가자 A", "fake", "fake-a", "")]
+
+    with pytest.raises(ConfigError) as e:
+        build_pool(specs, None, meter, settings,
+                   fake=FakeProvider(), real_for={"groq"})
+
+    assert "groq" in str(e.value)

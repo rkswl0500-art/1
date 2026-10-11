@@ -147,3 +147,97 @@ def test_agent_flag_without_stance_still_works():
 
     assert spec.stance is None
     assert spec.persona == DEFAULT_PERSONA
+
+
+# ── calibrate: 측정 도구가 거짓 수치를 내지 않는가 ──────────────────────────
+
+def _history(db_path):
+    """실제 히스토리를 흉내 낸 DB — fake 섞임, 접두사 두 표기, 잘린 판정."""
+    import sqlite3
+
+    from debate.storage import SqliteStore
+
+    SqliteStore(db_path).close()                      # 스키마만
+    c = sqlite3.connect(db_path)
+
+    def debate(did, prov="gemini"):
+        c.execute("INSERT INTO debates (debate_id, topic, status, rounds, created_at)"
+                  " VALUES (?,?,?,?,?)", (did, "T", "completed", 2, "2026-10-01"))
+        for i in range(3):
+            c.execute("INSERT INTO issues VALUES (?,?,?)", (did, f"i{i}", "쟁점"))
+        for i in range(2):
+            c.execute("INSERT INTO participants VALUES (?,?,?,?,?,?,?,?)",
+                      (did, f"p{i}", "참가자 A", prov, "models/flash-lite"
+                       if i == 0 else "flash-lite", "", "", 0))
+
+    def call(did, purpose, provider, model, out, finish="stop"):
+        c.execute("INSERT INTO llm_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (f"{did}{purpose}{model}{out}{finish}", did, purpose, "p0", provider,
+                   model, 1, 1000, out, "0", 1, 500, 1, finish))
+
+    def turn(did, agent, out, chars):
+        c.execute("INSERT INTO utterances VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (did, 1, agent, "가" * chars, "ok", None, 1000, out, 500, "0", "stop"))
+
+    debate("d_real")
+    call("d_real", "judge", "gemini", "models/flash-preview", 1150)
+    call("d_real", "judge", "gemini", "flash-preview", 1190)      # 같은 모델, 다른 표기
+    call("d_real", "judge", "gemini", "flash-preview", 408, finish="length")
+    turn("d_real", "p0", 260, 420)
+
+    debate("d_fake", prov="fake")                                  # fake 실행
+    call("d_fake", "judge", "fake", "models/flash-preview", 156)
+    turn("d_fake", "p0", 130, 161)
+    c.commit()
+    c.close()
+
+
+def _calibrate(tmp_path, monkeypatch, capsys) -> str:
+    db = tmp_path / "debates.db"
+    _history(db)
+    monkeypatch.setenv("DEBATE_DB_PATH", str(db))
+    assert cli.main(["calibrate"]) == 0
+    return capsys.readouterr().out
+
+
+def test_calibrate_excludes_fake_runs_and_says_so(tmp_path, monkeypatch, capsys):
+    """fake 모드는 모델명을 고른 그대로 남깁니다 — 그 설정을 리허설했다는
+    기록이라 지우지 않습니다. 대신 provider 로 걸러야 합니다.
+
+    예전 쿼리는 모델명으로만 묶어서, fake 출력(156tok)이 실제 심판 모델의
+    실측치로 보고됐습니다. 측정 도구가 거짓 합격을 내는 건 측정 안 한 것보다
+    나쁩니다.
+    """
+    out = _calibrate(tmp_path, monkeypatch, capsys)
+
+    assert "fake 실행 1건을 뺐습니다" in out        # 조용히 거르지 않습니다
+    assert "156" not in out                        # fake 판정 길이가 안 섞입니다
+    assert "161" not in out                        # fake 발언 글자수도
+
+
+def test_calibrate_merges_prefix_spellings(tmp_path, monkeypatch, capsys):
+    """`models/x` 와 `x` 가 따로 집계되면 건수가 반으로 보이고 평균도 갈립니다."""
+    out = _calibrate(tmp_path, monkeypatch, capsys)
+
+    assert "접두사만 다른 표기를 합쳤습니다" in out
+    assert "flash-preview ← flash-preview, models/flash-preview" in out
+
+
+def test_calibrate_separates_truncated_verdicts(tmp_path, monkeypatch, capsys):
+    """잘린 판정을 평균에 섞으면 '간결한 모델'로 오독됩니다.
+
+    여기 1,150 / 1,190 은 정상이고 408 은 finish_reason='length' 입니다.
+    셋을 섞으면 916 — 실제보다 22% 낮습니다. 그 숫자로 벤더 성향을 논하면
+    버그를 성향으로 착각하게 됩니다.
+    """
+    out = _calibrate(tmp_path, monkeypatch, capsys)
+
+    assert "1,170" in out                          # (1150+1190)/2, 408 제외
+    assert "916" not in out                        # 셋을 섞은 값이 나오면 안 됩니다
+    assert "⚠ 잘린 판정이 있습니다: 'length'×1" in out
+
+
+def test_model_key_normalizes_vendor_prefixes():
+    assert cli._model_key("models/gemini-3.5-flash-lite") == "gemini-3.5-flash-lite"
+    assert cli._model_key("openai/gpt-oss-120b") == "gpt-oss-120b"
+    assert cli._model_key("gemini-3.5-flash-lite") == "gemini-3.5-flash-lite"

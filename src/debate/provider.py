@@ -21,7 +21,9 @@ import re
 import random
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, Literal, Mapping, Protocol, Sequence, runtime_checkable
+from typing import (
+    Callable, Collection, Literal, Mapping, Protocol, Sequence, runtime_checkable,
+)
 
 import httpx
 
@@ -550,20 +552,35 @@ def build_pool(
     *,
     fake: FakeProvider | None = None,
     dump: Callable[[ChatRequest, dict], None] | None = None,
+    real_for: Collection[str] = (),
 ) -> ProviderPool:
     """참가자들이 실제로 참조하는 프로바이더만 조립합니다.
 
     fake 가 주어지면 참가자의 provider 필드와 무관하게 전부 fake 로 흘립니다
     (슬라이스 1 검증 모드). 그 외에는 이름별로 슬롯을 찾아 조립하고, 없는
     이름을 참조하면 LLM 을 한 번도 부르기 전에 ConfigError 로 죽습니다.
+
+    `real_for` 는 fake 모드에서도 **실제 슬롯을 쓸 프로바이더 이름**입니다.
+    "토론자는 fake, 심판만 진짜" 구성을 위해 있습니다 — 벤더별 판정 길이를
+    재려면 발언이 매번 동일해야 하고(fake 는 결정론적입니다), 그래야 길이
+    차이에 주제·발언 변동이 안 섞입니다. 이게 없으면 fake 모드는 심판까지
+    fake 로 끌고 가서 그 측정 자체가 불가능합니다.
     """
     wanted = {s.provider for s in specs}
+    real = {n for n in real_for if n and n != FAKE_PROVIDER}
 
     if fake is not None:
         wrapped = MeteredProvider(
             RetryingProvider(fake, attempts=settings.retry_attempts), meter
         )
-        return ProviderPool({name: wrapped for name in wanted | {FAKE_PROVIDER}})
+        pool = {name: wrapped for name in (wanted | {FAKE_PROVIDER}) - real}
+        if real:
+            if registry is None:
+                raise ConfigError(
+                    f"{', '.join(sorted(real))} 를 실제로 쓰려면 레지스트리가 "
+                    "필요합니다 (fake 모드라도 이 프로바이더만은 진짜 슬롯을 씁니다)")
+            pool.update(_build_real(sorted(real), registry, meter, settings, dump))
+        return ProviderPool(pool)
 
     if registry is None:
         raise ConfigError("실제 프로바이더로 돌리려면 레지스트리가 필요합니다")
@@ -575,8 +592,18 @@ def build_pool(
             f"  {registry.source_hint()}"
         )
 
+    return ProviderPool(_build_real(sorted(wanted), registry, meter, settings, dump))
+
+
+def _build_real(names, registry, meter, settings, dump) -> dict[str, ChatProvider]:
+    missing = sorted(set(names) - set(registry.names()))
+    if missing:
+        raise ConfigError(
+            f"프로바이더를 찾을 수 없습니다: {', '.join(missing)}\n"
+            f"  {registry.source_hint()}"
+        )
     built: dict[str, ChatProvider] = {}
-    for name in sorted(wanted):
+    for name in names:
         raw = OpenAICompatProvider(
             registry.get(name),
             timeout_s=settings.request_timeout_s,
@@ -586,4 +613,4 @@ def build_pool(
         built[name] = MeteredProvider(
             RetryingProvider(raw, attempts=settings.retry_attempts), meter
         )
-    return ProviderPool(built)
+    return built

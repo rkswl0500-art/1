@@ -277,3 +277,41 @@ def test_api_gate_default_does_not_stall_non_interactive_callers():
         api.Participant(provider="fake", model="fake-b"),
     ])
     assert body.gate_timeout_s == 0.0
+
+
+# ── tailscale serve 경유 — 실측 기반 ────────────────────────────────────────
+
+def test_tailnet_client_is_refused_even_though_the_bind_is_loopback(env):
+    """`tailscale serve` 를 거치면 클라이언트 주소가 **폰의 tailnet IP** 입니다.
+
+    실측(사용자 환경, 2026-10): `100.75.85.54:0`. 포트가 0 인 것까지 그대로
+    옮겼습니다 — 프록시가 소켓 주소를 그렇게 넘깁니다.
+
+    여기서 중요한 건 서버가 `127.0.0.1` 에 바인드돼 있어도 이 요청이 들어온다는
+    점입니다. 바인드 주소로 "밖에서 닿는가"를 판정했다면 통과시켰을 요청을,
+    **요청 출처**로 판정하기 때문에 막습니다.
+    """
+    with TestClient(api.app, client=("100.75.85.54", 0)) as c:
+        r = c.get("/config/providers")
+
+    assert r.status_code == 403
+    assert "100.75.85.54" in r.json()["detail"]      # 어디서 왔는지 밝힙니다
+
+
+def test_config_ui_off_refuses_the_tailnet_client_without_looking_at_origin(env, monkeypatch):
+    """보장은 off 가 합니다 — 출처를 보기 **전에** 걸립니다.
+
+    폰에서 404 가 나온 건 이 경로입니다. 403 이 나온다면 off 가 안 먹은 것이고,
+    그때는 두 번째 방어선이 대신 막고 있는 상태입니다.
+    """
+    monkeypatch.setenv("DEBATE_CONFIG_UI", "off")
+    with TestClient(api.app, client=("100.75.85.54", 0)) as c:
+        r = c.get("/config/providers")
+
+    assert r.status_code == 404
+
+
+def test_debate_page_stays_open_to_the_tailnet(env):
+    """설정만 막고 토론 화면은 열려야 합니다 — 안 그러면 다기기 자체가 무의미합니다."""
+    with TestClient(api.app, client=("100.75.85.54", 0)) as c:
+        assert c.get("/").status_code == 200
