@@ -712,8 +712,14 @@ def _cmd_serve(args) -> int:
 
     print(f"bind {host}:{port} | workers=1 | config_ui={settings.config_ui}")
     if loopback:
-        print("  루프백 바인드입니다 — 다른 기기에서는 붙지 않습니다 "
-              "(DEBATE_HOST=0.0.0.0 또는 tailscale serve).")
+        # `tailscale serve` 는 프록시가 127.0.0.1 로 붙으므로 루프백 바인드가
+        # **올바른** 구성입니다. 예전 메시지는 이 경우에도 "다른 기기에서는 붙지
+        # 않는다"고 단정해서, 제대로 맞춰 놓은 사람에게 틀렸다고 말했습니다.
+        print("  루프백 바인드 — 이 주소로 직접 붙을 수 있는 건 이 컴퓨터뿐입니다.")
+        print("  · `tailscale serve --bg {}` 로 프록시 중이라면 이게 맞는 구성입니다 "
+              "(프록시가 127.0.0.1 로 붙습니다).".format(port))
+        print("  · 프록시 없이 폰에서 직접 붙으려면 DEBATE_HOST 를 tailscale IP 로 "
+              "바꾸십시오.")
     else:
         # 요청만 보고는 바인드 주소를 알 수 없지만(api._require_local 참고),
         # 여기서는 우리가 바인드하는 쪽이라 확실히 압니다. 유일하게 이 사실을

@@ -760,26 +760,57 @@ Cloudflare Tunnel 같은 공개 URL 방식은 결국 인증을 따로 붙여야 
 키가 아니라 쿼터입니다. Tailscale 은 tailnet 밖에서 접근 자체가 안 되므로 애플리케이션
 쪽에 인증 코드를 넣지 않아도 됩니다.
 
-### 절차
+### 방법 A — `tailscale serve` (권장)
+
+**바인드 주소를 바꾸지 않습니다.** 프록시가 `127.0.0.1` 로 붙으므로 루프백 기본값이
+그대로 맞는 구성입니다. HTTPS 가 붙고, 소켓이 LAN 에 노출되지 않습니다.
+
+```powershell
+tailscale serve --bg 8000           # tailnet:443 → 127.0.0.1:8000
+$env:DEBATE_CONFIG_UI="off"         # 설정 화면(.env/키)을 완전히 끕니다
+python -m debate.cli serve          # DEBATE_HOST 는 건드리지 않습니다
+```
+
+폰에서 `https://<머신>.<tailnet>.ts.net/`.
+
+### 방법 B — tailscale IP 에 직접 바인드
+
+프록시를 쓰지 않을 때입니다.
 
 ```bash
-# 1. 바인드 주소 — 기본값 127.0.0.1 은 같은 컴퓨터에서만 열립니다
-export DEBATE_HOST=100.x.y.z     # tailscale ip -4 로 확인한 이 머신의 주소
-export DEBATE_CONFIG_UI=off      # 설정 화면(.env/키)을 완전히 끕니다
-export DEBATE_PORT=8000
-
-# 2. 이 변수들을 읽는 건 serve 뿐입니다 (아래 주의 참고)
+export DEBATE_HOST=100.x.y.z     # tailscale ip -4
+export DEBATE_CONFIG_UI=off
 python -m debate.cli serve
 ```
 
 폰에서 `http://100.x.y.z:8000`.
 
-| 설정 | 기본값 | 다기기에서 |
-|---|---|---|
-| `DEBATE_HOST` | `127.0.0.1` | tailscale IP (권장) 또는 `0.0.0.0` |
-| `DEBATE_PORT` | `8000` | 그대로 |
-| `DEBATE_CONFIG_UI` | `local` | **`off`** |
-| 워커 수 | 1 | **1 고정** (아래) |
+| 설정 | 기본값 | 방법 A | 방법 B |
+|---|---|---|---|
+| `DEBATE_HOST` | `127.0.0.1` | **그대로** | tailscale IP |
+| `DEBATE_PORT` | `8000` | 그대로 | 그대로 |
+| `DEBATE_CONFIG_UI` | `local` | **`off`** | **`off`** |
+| 워커 수 | 1 | **1 고정** (아래) | **1 고정** |
+
+### 포트가 이미 쓰이고 있으면
+
+`tailscale serve --bg 8000` 은 8000 을 점유하지 않습니다 — tailnet 의 443 에서 듣고
+`127.0.0.1:8000` 으로 넘길 뿐입니다. 그러니 bind 실패는 **다른 서버가 이미 떠
+있다는 뜻**입니다(예전에 띄운 `uvicorn` 이 흔한 범인입니다).
+
+uvicorn 은 `Application startup complete` 를 찍은 **뒤에** bind 오류를 내므로 성공한
+것처럼 보입니다. 아래가 진짜 상태입니다:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8000 -State Listen |
+  ForEach-Object { Get-Process -Id $_.OwningProcess } |
+  Select-Object Id, ProcessName, Path
+```
+
+```
+ERROR: [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8000)
+→ 그 PID 를 Stop-Process 하거나, DEBATE_PORT 와 `tailscale serve` 를 같은 다른 포트로
+```
 
 ### 주의 네 가지
 
@@ -792,10 +823,10 @@ python -m debate.cli serve
 있습니다. 워커가 2개 이상이면 토론을 시작한 워커가 아닌 쪽에 `/stream` 이 붙는
 순간 404 가 납니다. `serve` 는 `workers=1` 로 고정하므로 이 구성을 만들 수 없습니다.
 
-**3. `0.0.0.0` 은 tailnet 말고도 열립니다.** tailscale IP 로 바인드하면 그 인터페이스
-에서만 듣습니다. `0.0.0.0` 은 같은 카페 와이파이에 있는 사람에게도 열립니다 —
-Tailscale 을 쓰는 이유가 거기서 사라집니다. `tailscale serve` 로 프록시하는 방법도
-있습니다. 어느 쪽이든 설정 화면 차단을 보장하는 건 `DEBATE_CONFIG_UI=off` 입니다
+**3. `0.0.0.0` 은 tailnet 말고도 열립니다.** 방법 A 는 루프백이라 해당 없고, 방법 B
+에서 tailscale IP 로 바인드하면 그 인터페이스에서만 듣습니다. `0.0.0.0` 은 같은 카페
+와이파이에 있는 사람에게도 열립니다 — Tailscale 을 쓰는 이유가 거기서 사라집니다.
+어느 쪽이든 설정 화면 차단을 보장하는 건 `DEBATE_CONFIG_UI=off` 입니다
 (프록시 헤더 거부는 켜 뒀을 때의 부수적인 방어선이지, 기대야 할 장치가 아닙니다).
 
 **4. 호스트가 꺼지면 끝입니다.** 노트북이 슬립에 들면 폰에서 안 붙습니다. 재시작하면
