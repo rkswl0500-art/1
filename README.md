@@ -853,6 +853,30 @@ ERROR: [Errno 10048] error while attempting to bind on address ('127.0.0.1', 800
 `127.0.0.1:8111 (LISTEN)`, `DEBATE_HOST=0.0.0.0` 은 `*:8112 (LISTEN)`. 인터페이스
 주소로 접속하면 전자는 `ConnectionRefusedError`, 후자는 연결됩니다.
 
+### 실연결 확인 (2026-10, Windows + tailscale serve)
+
+```
+tailscale serve --bg 8000        # tailnet:443 → 127.0.0.1:8000
+$env:DEBATE_CONFIG_UI="off"
+python -m debate.cli serve       # bind 127.0.0.1:8000 | workers=1 | config_ui=off
+```
+
+폰에서 `https://<머신>.<tailnet>.ts.net/` 접속:
+
+| 확인 | 결과 |
+|---|---|
+| `/` | 200 — 토론 화면 |
+| `/config/providers` | **404** (`설정 UI 가 꺼져 있습니다`) |
+| HTTPS | `tailscale serve` 가 붙여줌 |
+
+이걸로 1단계는 끝입니다. 애플리케이션에 인증 코드를 넣지 않았고, 바인드 주소도
+기본값 그대로입니다.
+
+**이 확인이 증명하지 않는 것 하나:** `/config/providers` 가 404 인 건
+`DEBATE_CONFIG_UI=off` 가 프록시 헤더 검사보다 **먼저** 걸리기 때문입니다
+(`_require_local` 의 첫 줄). 그래서 `tailscale serve` 가 프록시 헤더를 붙이는지는
+여전히 확인되지 않았습니다 — 다만 보장은 `off` 가 하므로 답을 몰라도 됩니다.
+
 ### 폰 화면 (390px 실측)
 
 fake 토론을 판정까지 끝낸 상태에서 측정했습니다. **가로 오버플로는 없습니다** —
