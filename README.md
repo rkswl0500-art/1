@@ -766,12 +766,34 @@ Cloudflare Tunnel 같은 공개 URL 방식은 결국 인증을 따로 붙여야 
 그대로 맞는 구성입니다. HTTPS 가 붙고, 소켓이 LAN 에 노출되지 않습니다.
 
 ```powershell
-tailscale serve --bg 8000           # tailnet:443 → 127.0.0.1:8000
-$env:DEBATE_CONFIG_UI="off"         # 설정 화면(.env/키)을 완전히 끕니다
-python -m debate.cli serve          # DEBATE_HOST 는 건드리지 않습니다
+tailscale serve --bg 8000           # tailnet:443 → 127.0.0.1:8000 (한 번만)
+.\scripts\start-remote.ps1          # 서버
 ```
 
 폰에서 `https://<머신>.<tailnet>.ts.net/`.
+
+`start-remote.ps1` 이 대신해 주는 것:
+
+- **`DEBATE_CONFIG_UI=off`** — 매번 손으로 치면 빠뜨립니다. 빠뜨려도 폰에서는
+  `_require_local` 이 403 으로 막지만, 그건 두 번째 방어선이지 보장이 아닙니다.
+- **리포 루트에서 실행** — `pricing_path` / `db_path` / `env_path` 가 전부 상대
+  경로라, 다른 폴더에서 띄우면 빈 `.env` 와 새 DB 를 조용히 만듭니다. 키가 안
+  읽히는 채로 서버가 떠서 원인을 찾기 어려운 쪽으로 실패합니다.
+- **포트 선점 확인** — 이미 쓰이고 있으면 PID 와 프로세스 이름을 찍고 멈춥니다.
+  uvicorn 은 `Application startup complete` 를 찍은 **뒤에** bind 오류를 내서
+  성공한 것처럼 보입니다.
+- **끝나면 환경변수 복구** — 호출한 창에 `off` 가 남으면, 나중에 로컬에서 설정
+  화면을 열 때 404 가 나는 이유를 못 찾습니다.
+
+```powershell
+.\scripts\start-remote.ps1 -Port 8001   # 포트를 옮길 때 (serve 도 같이 옮기십시오)
+```
+
+> 이 스크립트는 **실행 검증을 하지 못했습니다** — 개발 환경에 PowerShell 이 없습니다.
+> 로직은 단순하지만 Windows 에서 처음 돌릴 때는 출력을 확인해 주십시오. 파일은
+> UTF-8 **BOM 포함**으로 저장돼 있습니다. Windows PowerShell 5.1 은 BOM 이 없으면
+> `.ps1` 을 시스템 ANSI 코드페이지로 읽어 한글 메시지가 깨집니다 (`.env` 는 반대로
+> BOM 이 없어야 합니다 — 읽는 쪽이 다르면 요구도 반대가 됩니다).
 
 ### 방법 B — tailscale IP 에 직접 바인드
 
@@ -868,6 +890,7 @@ python -m debate.cli serve       # bind 127.0.0.1:8000 | workers=1 | config_ui=o
 | `/` | 200 — 토론 화면 |
 | `/config/providers` | **404** (`설정 UI 가 꺼져 있습니다`) |
 | HTTPS | `tailscale serve` 가 붙여줌 |
+| 실기기 (LTE, 와이파이 아님) | 토론 실행 · `지시 없이 바로 진행` 모두 동작 |
 
 이걸로 1단계는 끝입니다. 애플리케이션에 인증 코드를 넣지 않았고, 바인드 주소도
 기본값 그대로입니다.
