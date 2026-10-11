@@ -498,7 +498,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     """
     import sqlite3
 
-    from .judge import verdict_content_tokens
+    from .judge import required_output_tokens, verdict_content_tokens
 
     settings = Settings()
     if not settings.db_path.is_file():
@@ -541,6 +541,9 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     by_model: dict[str, list[tuple[int, int, bool, bool]]] = {}
     spellings: dict[str, set[str]] = {}
     finishes: dict[str, int] = {}
+    #: 잘린 1차 호출의 (본문 토큰, 그때 준 예산). 기록에는 예산이 없지만 자동
+    #: 계산이었다면 쟁점·참가자 수로 다시 구할 수 있습니다.
+    cut_vs_budget: dict[str, list[tuple[int, int]]] = {}
     for r in rows:
         key = _model_key(r["model"])
         spellings.setdefault(key, set()).add(r["model"])
@@ -548,6 +551,10 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         repair = r["seq"] > 1
         if cut:
             finishes[r["finish_reason"]] = finishes.get(r["finish_reason"], 0) + 1
+            if not repair:
+                budget = settings.judge_max_tokens or required_output_tokens(
+                    max(1, r["issues"]), max(1, r["parts"]))
+                cut_vs_budget.setdefault(key, []).append((r["out_tok"], budget))
         modelled = verdict_content_tokens(max(1, r["issues"]), max(1, r["parts"]))
         by_model.setdefault(key, []).append((r["out_tok"], modelled, cut, repair))
 
@@ -594,9 +601,26 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     if finishes:
         detail = ", ".join(f"{k!r}×{v}" for k, v in sorted(finishes.items()))
         print(f"\n  ⚠ 잘린 판정 호출: {detail}")
-        print("  thinking 계열은 사고 토큰이 같은 출력 예산을 먹습니다. 잘린 호출의")
-        print("  out_tok 이 예산보다 한참 작으면 그 차액이 사고 몫입니다 — 그 경우")
-        print("  예산만 올리면 사고가 늘어난 만큼 또 먹습니다.")
+        # 원인을 가르는 숫자. 본문이 예산에 가까우면 진짜로 길이가 모자란 것이고
+        # (예산 상향이 답), 한참 적으면 차액은 응답에 안 보이는 사고 토큰입니다
+        # (예산만 올리면 사고가 그만큼 더 먹습니다).
+        src = (f"DEBATE_JUDGE_MAX_TOKENS={settings.judge_max_tokens}"
+               if settings.judge_max_tokens else "자동 계산(required_output_tokens)")
+        for model, pairs in sorted(cut_vs_budget.items()):
+            body = sum(o for o, _ in pairs) / len(pairs)
+            budget = sum(b for _, b in pairs) / len(pairs)
+            share = body / budget if budget else 0
+            print(f"    {model}: 잘린 1차 {len(pairs)}건 — 본문 평균 {body:,.0f}tok "
+                  f"/ 예산 {budget:,.0f}tok ({share:.0%})")
+            if share < 0.5:
+                print("      본문이 예산의 절반도 안 됩니다. 나머지는 응답에 안 보이는 "
+                      "사고 토큰으로 보입니다 —")
+                print("      예산 상향보다 사고 예산·수준을 낮추는 쪽이 원인에 닿습니다.")
+            else:
+                print("      본문이 예산 대부분을 썼습니다. 진짜로 길이가 모자란 것이라 "
+                      "예산 상향이 답입니다.")
+        print(f"  (예산은 현재 설정으로 다시 계산했습니다: {src}. 그 실행들 이후 "
+              "설정을 바꿨다면 이 값은 틀립니다.)")
 
     # 여기까지는 **호출** 기준입니다. 사용자가 실제로 본 건 verdicts 입니다 —
     # 잘려도 복구에 성공하면 status='ok' 로 완결된 판정을 봅니다. 둘을 구분하지

@@ -297,3 +297,21 @@ def test_model_key_normalizes_vendor_prefixes():
     assert cli._model_key("models/gemini-3.5-flash-lite") == "gemini-3.5-flash-lite"
     assert cli._model_key("openai/gpt-oss-120b") == "gpt-oss-120b"
     assert cli._model_key("gemini-3.5-flash-lite") == "gemini-3.5-flash-lite"
+
+
+def test_calibrate_reports_body_vs_budget_for_truncated_calls(tmp_path, monkeypatch, capsys):
+    """잘림의 원인을 가르는 숫자입니다.
+
+    본문이 예산에 가까우면 진짜로 길이가 모자란 것(예산 상향), 한참 적으면 차액은
+    응답에 안 보이는 사고 토큰입니다(예산만 올리면 사고가 그만큼 더 먹습니다).
+    기록에 예산은 없지만 자동 계산이었다면 쟁점·참가자 수로 다시 구할 수 있어서,
+    **새로 돌리지 않고 기존 히스토리로** 답이 나옵니다.
+    """
+    from debate.judge import required_output_tokens
+
+    out = _calibrate(tmp_path, monkeypatch, capsys)
+
+    budget = required_output_tokens(3, 2)
+    assert f"예산 {budget:,}tok" in out
+    assert "본문 평균 409tok" in out                 # (408 + 410) / 2
+    assert "사고 예산·수준을 낮추는 쪽" in out
