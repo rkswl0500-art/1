@@ -179,11 +179,31 @@ def _history(db_path):
         c.execute("INSERT INTO utterances VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                   (did, 1, agent, "가" * chars, "ok", None, 1000, out, 500, "0", "stop"))
 
-    debate("d_real")
-    call("d_real", "judge", "gemini", "models/flash-preview", 1150)
-    call("d_real", "judge", "gemini", "flash-preview", 1190)      # 같은 모델, 다른 표기
-    call("d_real", "judge", "gemini", "flash-preview", 408, finish="length")
-    turn("d_real", "p0", 260, 420)
+    # 판정은 토론당 1건이 정상입니다. 한 토론에 2건이면 뒤엣것이 복구 호출이라,
+    # 토론을 나눠야 '1차 3건' 이라는 실제 형태가 됩니다.
+    debate("d_r1")
+    call("d_r1", "judge", "gemini", "models/flash-preview", 1150)
+    turn("d_r1", "p0", 260, 420)
+
+    debate("d_r2")
+    call("d_r2", "judge", "gemini", "flash-preview", 1190)        # 같은 모델, 다른 표기
+
+    debate("d_r3")                                                 # 잘리고 복구 못 함
+    call("d_r3", "judge", "gemini", "flash-preview", 408, finish="length")
+
+    debate("d_r4")                                                 # 잘렸다가 복구 성공
+    call("d_r4", "judge", "gemini", "flash-preview", 410, finish="length")
+    call("d_r4", "judge", "gemini", "flash-preview", 520)          # ← 복구(짧게 지시받음)
+
+    def verdict(did, status="ok", finish="stop", attempts=1):
+        c.execute("INSERT INTO verdicts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (did, "flash-preview", status, "참가자 A", "narrow", "", "",
+                   "{}", "[]", "{}", 1900, finish, attempts, "", ""))
+
+    verdict("d_r1")                                   # 그냥 정상
+    verdict("d_r2")
+    verdict("d_r3", status="unparsed", finish="length", attempts=2)   # 사용자가 본 실패
+    verdict("d_r4", attempts=2)                       # 복구 성공 — 사용자는 완결본을 봄
 
     debate("d_fake", prov="fake")                                  # fake 실행
     call("d_fake", "judge", "fake", "models/flash-preview", 156)
@@ -226,15 +246,51 @@ def test_calibrate_merges_prefix_spellings(tmp_path, monkeypatch, capsys):
 def test_calibrate_separates_truncated_verdicts(tmp_path, monkeypatch, capsys):
     """잘린 판정을 평균에 섞으면 '간결한 모델'로 오독됩니다.
 
-    여기 1,150 / 1,190 은 정상이고 408 은 finish_reason='length' 입니다.
-    셋을 섞으면 916 — 실제보다 22% 낮습니다. 그 숫자로 벤더 성향을 논하면
-    버그를 성향으로 착각하게 됩니다.
+    1차 4건 중 1,150 / 1,190 은 정상, 408 과 410 은 length 입니다. 넷을 섞으면
+    790 — 실제보다 32% 낮습니다. 그 숫자로 벤더 성향을 논하면 버그를 성향으로
+    착각합니다.
     """
     out = _calibrate(tmp_path, monkeypatch, capsys)
 
-    assert "1,170" in out                          # (1150+1190)/2, 408 제외
-    assert "916" not in out                        # 셋을 섞은 값이 나오면 안 됩니다
-    assert "⚠ 잘린 판정이 있습니다: 'length'×1" in out
+    assert "1,170" in out                          # (1150+1190)/2
+    assert "790" not in out                        # 넷을 섞은 값
+    assert "'length'×2" in out
+
+
+def test_calibrate_excludes_repair_calls_from_the_average(tmp_path, monkeypatch, capsys):
+    """복구 호출은 '짧게 쓰라'고 지시받은 응답이라 길이의 근거가 못 됩니다.
+
+    d_r4 의 520 은 복구 건입니다. 평균에 들어가면 (1150+1190+520)/3 = 953 이
+    되어, 잘린 건을 뺀 효과가 복구 건 때문에 도로 사라집니다.
+    """
+    out = _calibrate(tmp_path, monkeypatch, capsys)
+
+    assert "953" not in out
+    assert "1,170" in out
+
+
+def test_calibrate_warns_about_survivorship_bias(tmp_path, monkeypatch, capsys):
+    """잘림이 많으면 남은 평균은 '마침 짧게 끝난 판정' 쪽으로 쏠립니다.
+
+    경고가 없으면 그 평균으로 벤더 계수를 정하게 됩니다 — 측정 도구가 틀린
+    결론을 거들어서는 안 됩니다.
+    """
+    out = _calibrate(tmp_path, monkeypatch, capsys)       # 1차 4건 중 2건 잘림 = 50%
+
+    assert "생존 편향" in out
+    assert "벤더 계수 근거로 쓰지 마십시오" in out
+
+
+def test_calibrate_separates_what_users_actually_saw(tmp_path, monkeypatch, capsys):
+    """`length` 호출이 있다고 사용자가 잘린 판정을 본 건 아닙니다.
+
+    복구에 성공하면 verdicts 는 status='ok' 이고 사용자는 완결된 판정을 봅니다.
+    호출 기준과 판정 기준을 구분하지 않으면 "판정 42% 가 잘려 보였다" 같은
+    틀린 결론이 나옵니다.
+    """
+    out = _calibrate(tmp_path, monkeypatch, capsys)
+
+    assert "사용자가 실제로 본 판정" in out
 
 
 def test_model_key_normalizes_vendor_prefixes():

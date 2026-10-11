@@ -96,6 +96,22 @@ class Verdict:
     #: 'length' 면 판정이 잘린 것입니다. 단일 패스를 언제 갈라야 할지의 신호.
     finish_reason: str | None = None
     parse_attempts: int = 1
+    #: 1차 출력이 길이 제한에 걸려 **복구 호출로 다시 받았는지**.
+    #:
+    #: 복구가 성공하면 status 는 'ok' 이고 finish_reason 도 'stop' 이라, 기록만
+    #: 보면 아무 일도 없던 것처럼 보입니다. 그런데 복구 프롬프트는 "각 reasoning
+    #: 을 한 문장으로" 라고 **짧게 쓰라고 지시**합니다 — 그 판정은 이 모델이
+    #: 평소 쓰는 길이가 아닙니다. 벤더별 길이를 비교할 때 이 건을 섞으면 짧은
+    #: 쪽으로 치우칩니다. 사용자에게도 "이건 줄여서 받은 판정"이라고 알려야
+    #: 합니다.
+    repaired_from_truncation: bool = False
+    #: 1차 호출에 준 출력 예산과 그때 실제로 돌아온 본문 토큰.
+    #:
+    #: 'length' 인데 본문이 예산보다 한참 적으면, 차액은 응답에 안 보이는
+    #: 사고 토큰입니다. 이 두 숫자가 같이 있어야 "예산이 모자랐다" 와
+    #: "사고가 예산을 먹었다" 를 구분할 수 있습니다.
+    first_budget: int = 0
+    first_output_tokens: int = 0
     #: Judge 에게 실제로 보낸 프롬프트 전문.
     #:
     #: 저장해 두는 이유는 익명화를 **증명**하기 위해서입니다. 모델명이 안 샌다는
@@ -189,6 +205,7 @@ class Judge:
 
         budget = self._max_tokens or required_output_tokens(len(issues), len(labels))
         raw, resp, truncated = "", None, False
+        first_budget, first_out, repaired = budget, 0, False
 
         for attempt in (1, 2):
             resp = await self._provider.chat(ChatRequest(
@@ -198,18 +215,23 @@ class Judge:
             ))
             raw = resp.text
             truncated = resp.finish_reason == "length"
+            if attempt == 1:
+                first_out = resp.usage.completion_tokens
             try:
                 verdict = _parse(raw, labels, issues)
                 return replace(
                     verdict, raw=raw, judge_model=resp.model,
                     prompt_tokens=resp.usage.prompt_tokens,
                     finish_reason=resp.finish_reason, parse_attempts=attempt,
+                    repaired_from_truncation=repaired,
+                    first_budget=first_budget, first_output_tokens=first_out,
                     prompt_text=sent,
                 )
             except ValueError as e:
                 if attempt == 2:
                     break
                 if truncated:
+                    repaired = True
                     # 같은 예산으로 다시 부르면 같은 자리에서 또 잘립니다.
                     # 예산을 늘리면서 동시에 더 짧게 쓰라고 지시합니다 —
                     # 예산만 올리면 장황한 모델은 늘어난 만큼 더 씁니다.
@@ -235,7 +257,9 @@ class Judge:
             judge_model=resp.model if resp else self._model,
             prompt_tokens=resp.usage.prompt_tokens if resp else 0,
             finish_reason=resp.finish_reason if resp else None,
-            parse_attempts=2, prompt_text=sent,
+            parse_attempts=2, repaired_from_truncation=repaired,
+            first_budget=first_budget, first_output_tokens=first_out,
+            prompt_text=sent,
         )
 
     def _render_transcript(self, transcript: Sequence[AnonUtterance]) -> str:

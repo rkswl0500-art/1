@@ -332,6 +332,16 @@ def _print_verdict(verdict) -> None:
     if verdict.truncated:
         print("  ⚠ 판정이 잘렸습니다(finish_reason=length). "
               "단일 패스 한계에 도달했을 수 있습니다.")
+    if verdict.repaired_from_truncation:
+        # status='ok' / finish_reason='stop' 이라 기록만 보면 아무 일도 없던
+        # 것처럼 보이지만, 복구 프롬프트가 "짧게 쓰라"고 지시했습니다.
+        print("  ⚠ 1차 판정이 잘려 **더 짧게 다시 받았습니다**. 점수는 유효하지만 "
+              "이 심판이 평소 쓰는 길이는 아닙니다.")
+        if verdict.first_budget and verdict.first_output_tokens:
+            gap = verdict.first_budget - verdict.first_output_tokens
+            print(f"     1차: 본문 {verdict.first_output_tokens:,}tok / 예산 "
+                  f"{verdict.first_budget:,}tok — 차액 {gap:,}tok 은 응답에 "
+                  "안 보이는 사고 토큰으로 보입니다.")
     for note in score_contradictions(verdict):
         # 점수 필드는 정확합니다. 산문만 틀렸으므로 표를 믿으라고 알려줍니다.
         print(f"  ⚠ {note}\n     위 표의 점수가 정확합니다.")
@@ -506,8 +516,13 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         print("  fake 는 모델명이 고른 그대로 남으므로, 모델명으로만 묶으면 "
               "실제 모델의 실측치로 보입니다.\n")
 
+    # 한 토론에 판정 호출이 둘 이상이면 뒤엣것은 **복구 호출**입니다. 복구
+    # 프롬프트는 "각 reasoning 을 한 문장으로" 라고 짧게 쓰라 지시하므로, 그
+    # 응답 길이는 이 모델이 평소 쓰는 길이가 아닙니다. 평균에 섞으면 짧은 쪽으로
+    # 치우칩니다 — 잘린 건을 빼는 것만으로는 부족합니다.
     rows = list(conn.execute("""
-        SELECT l.model, l.out_tok, l.in_tok, l.finish_reason, d.debate_id,
+        SELECT l.model, l.out_tok, l.finish_reason, d.debate_id,
+               ROW_NUMBER() OVER (PARTITION BY l.debate_id ORDER BY l.rowid) AS seq,
                (SELECT COUNT(*) FROM issues i WHERE i.debate_id = d.debate_id) AS issues,
                (SELECT COUNT(*) FROM participants p WHERE p.debate_id = d.debate_id) AS parts
         FROM llm_calls l JOIN debates d USING (debate_id)
@@ -519,35 +534,42 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         return 0
 
     print("판정 출력: 실측 대 모델 (verdict_content_tokens)\n")
-    print(f"  {'모델':28} {'건수':>4} {'잘림':>4} {'실측 평균':>9} {'모델 평균':>9} {'비율':>6}")
-    print("  " + "─" * 66)
+    print(f"  {'모델':24} {'1차':>4} {'잘림':>4} {'복구':>4} {'실측 평균':>9} "
+          f"{'모델 평균':>9} {'비율':>6}")
+    print("  " + "─" * 70)
 
-    by_model: dict[str, list[tuple[int, int, bool]]] = {}
+    by_model: dict[str, list[tuple[int, int, bool, bool]]] = {}
     spellings: dict[str, set[str]] = {}
     finishes: dict[str, int] = {}
     for r in rows:
         key = _model_key(r["model"])
         spellings.setdefault(key, set()).add(r["model"])
         cut = r["finish_reason"] not in _CLEAN_FINISH
+        repair = r["seq"] > 1
         if cut:
             finishes[r["finish_reason"]] = finishes.get(r["finish_reason"], 0) + 1
         modelled = verdict_content_tokens(max(1, r["issues"]), max(1, r["parts"]))
-        by_model.setdefault(key, []).append((r["out_tok"], modelled, cut))
+        by_model.setdefault(key, []).append((r["out_tok"], modelled, cut, repair))
 
-    for model, trips in sorted(by_model.items()):
-        # 잘린 판정의 길이는 '그 모델이 그만큼 쓴다' 는 뜻이 아니라 '예산이
-        # 거기서 끝났다' 는 뜻입니다. 평균에 섞으면 간결한 모델로 오독됩니다.
-        clean = [(a, m) for a, m, cut in trips if not cut]
-        cuts = sum(1 for *_, cut in trips if cut)
+    cut_rate: dict[str, float] = {}
+    for model, quads in sorted(by_model.items()):
+        # 평균에 넣는 건 **1차 호출이면서 잘리지 않은** 것뿐입니다.
+        #   잘린 건  — 길이가 아니라 예산이 끝난 지점입니다.
+        #   복구 건  — 짧게 쓰라고 지시받은 응답입니다.
+        first = [(a, m, cut) for a, m, cut, rep in quads if not rep]
+        clean = [(a, m) for a, m, cut in first if not cut]
+        cuts = sum(1 for *_, cut in first if cut)
+        repairs = sum(1 for *_, rep in quads if rep)
+        cut_rate[model] = cuts / len(first) if first else 0.0
         if not clean:
-            print(f"  {model:28} {len(trips):>4} {cuts:>4} {'—':>9} {'—':>9} "
-                  f"{'전부 잘림':>6}")
+            print(f"  {model:24} {len(first):>4} {cuts:>4} {repairs:>4} "
+                  f"{'—':>9} {'—':>9} {'전부 잘림':>6}")
             continue
         actual = sum(a for a, _ in clean) / len(clean)
         modelled = sum(m for _, m in clean) / len(clean)
         ratio = actual / modelled if modelled else 0
-        print(f"  {model:28} {len(trips):>4} {cuts:>4} {actual:>9,.0f} "
-              f"{modelled:>9,.0f} {ratio:>5.2f}x")
+        print(f"  {model:24} {len(first):>4} {cuts:>4} {repairs:>4} "
+              f"{actual:>9,.0f} {modelled:>9,.0f} {ratio:>5.2f}x")
 
     merged = {k: v for k, v in spellings.items() if len(v) > 1}
     if merged:
@@ -556,14 +578,50 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
             print(f"    {key} ← {', '.join(sorted(raws))}")
 
     print("\n  비율 1.00 이면 모델이 정확합니다. 1 보다 크면 모델이 낮게 잡는 것입니다.")
-    print("  평균은 **잘리지 않은 건만** 씁니다 — 잘린 판정의 길이는 모델의 성향이")
-    print("  아니라 예산이 끝난 지점입니다.")
+    print("  평균은 **1차 호출 중 잘리지 않은 건만** 씁니다 — 잘린 건은 예산이 끝난")
+    print("  지점이고, 복구 건은 '짧게 쓰라'고 지시받은 응답이라 둘 다 길이의")
+    print("  근거가 못 됩니다.")
+
+    # 생존 편향. 잘림이 많을수록 남은 표본은 '마침 짧게 끝난 판정' 쪽으로
+    # 쏠립니다. 이 경고가 없으면 그 평균으로 벤더 계수를 정하게 됩니다.
+    biased = sorted(m for m, rate in cut_rate.items() if rate >= 0.2)
+    if biased:
+        print(f"\n  ⚠ 생존 편향: {', '.join(biased)} 는 1차 호출의 20% 이상이")
+        print("  잘렸습니다. 잘린 건 길게 쓰려던 판정이므로, 남은 평균은 **실제보다")
+        print("  짧습니다.** 얼마나 짧은지는 이 데이터로 알 수 없습니다 — 이 숫자를")
+        print("  벤더 계수 근거로 쓰지 마십시오. 잘림을 먼저 고친 뒤 다시 재야 합니다.")
+
     if finishes:
         detail = ", ".join(f"{k!r}×{v}" for k, v in sorted(finishes.items()))
-        print(f"\n  ⚠ 잘린 판정이 있습니다: {detail}")
-        print("  이건 벤더 성향이 아니라 출력 예산 문제입니다. thinking 계열은 사고")
-        print("  토큰이 같은 예산을 먹습니다 — DEBATE_JUDGE_MAX_TOKENS 를 올리거나,")
-        print("  0(자동) 으로 두고 judge.required_output_tokens 를 보십시오.")
+        print(f"\n  ⚠ 잘린 판정 호출: {detail}")
+        print("  thinking 계열은 사고 토큰이 같은 출력 예산을 먹습니다. 잘린 호출의")
+        print("  out_tok 이 예산보다 한참 작으면 그 차액이 사고 몫입니다 — 그 경우")
+        print("  예산만 올리면 사고가 늘어난 만큼 또 먹습니다.")
+
+    # 여기까지는 **호출** 기준입니다. 사용자가 실제로 본 건 verdicts 입니다 —
+    # 잘려도 복구에 성공하면 status='ok' 로 완결된 판정을 봅니다. 둘을 구분하지
+    # 않으면 "판정 42% 가 잘려 보였다" 같은 틀린 결론이 나옵니다.
+    seen = list(conn.execute("""
+        SELECT judge_model, status, finish_reason, parse_attempts, COUNT(*) AS n
+        FROM verdicts GROUP BY judge_model, status, finish_reason, parse_attempts
+    """))
+    if seen:
+        total = sum(r["n"] for r in seen)
+        broken = [r for r in seen if r["status"] != "ok"]
+        repaired = sum(r["n"] for r in seen
+                       if r["status"] == "ok" and (r["parse_attempts"] or 1) > 1)
+        print(f"\n사용자가 실제로 본 판정 {total}건:")
+        print(f"  정상        {total - sum(r['n'] for r in broken) - repaired:>4}건")
+        print(f"  복구 후 정상 {repaired:>4}건   (점수는 유효, 길이는 줄여 받음)")
+        print(f"  실패        {sum(r['n'] for r in broken):>4}건", end="")
+        if broken:
+            kinds = ", ".join(f"{r['status']}/{r['finish_reason']}" for r in broken)
+            print(f"   ({kinds})")
+        else:
+            print("")
+        if repaired and not broken:
+            print("\n  잘린 호출이 있어도 **완결된 판정을 봤습니다** — 복구가 받아냈습니다.")
+            print("  비용은 판정 1건당 호출 2회로 늘고, 그 판정은 줄여 받은 것입니다.")
     if len(by_model) > 1:
         print("\n  모델(벤더)마다 비율이 뚜렷이 다르면 프로바이더별 계수를 둘 근거가"
               " 됩니다.")

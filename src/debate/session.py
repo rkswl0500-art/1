@@ -348,6 +348,12 @@ class DebateSession:
             "per_issue": [{"issue_id": s.issue_id, "scores": dict(s.scores),
                            "reasoning": s.reasoning} for s in v.per_issue],
             "truncated": v.truncated, "prompt_tokens": v.prompt_tokens,
+            # 복구에 성공하면 status='ok' / finish_reason='stop' 이라 기록만
+            # 보면 아무 일도 없던 것처럼 보입니다. 하지만 복구 프롬프트가
+            # "짧게 쓰라"고 지시하므로, 사용자가 보는 건 줄여 받은 판정입니다.
+            "repaired": v.repaired_from_truncation,
+            "first_budget": v.first_budget,
+            "first_output_tokens": v.first_output_tokens,
             # 산문의 점수가 표와 어긋나는 경우. 판정 자체는 유효하므로 실패로
             # 다루지 않고 표시만 합니다.
             "score_contradictions": list(score_contradictions(v)),
